@@ -1,0 +1,36 @@
+{
+  "name": "@evaldiff/evaldiff",
+  "version": "0.0.1",
+  "description": "CI for LLM prompts: datasets, eval runs, and regression diffs as a pass/fail gate. CLI placeholder + future GitHub Action.",
+  "main": "index.js",
+  "bin": {
+    "evaldiff": "bin/evaldiff.js"
+  },
+  "files": [
+    "bin",
+    "index.js"
+  ],
+  "scripts": {
+    "test": "node test.js"
+  },
+  "keywords": [
+    "llm",
+    "evals",
+    "eval",
+    "testing",
+    "ci",
+    "prompts",
+    "regression",
+    "github-action"
+  ],
+  "license": "MIT",
+  "author": "Peter Hedman <peter.mejl@gmail.com>",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/evaldiff/evaldiff.git"
+  },
+  "homepage": "https://evaldiff.io",
+  "engines": {
+    "node": ">=18"
+  }
+}

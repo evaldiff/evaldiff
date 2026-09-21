@@ -1,0 +1,40 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "evaldiff"
+version = "0.0.1"
+description = "CI for LLM prompts: datasets, eval runs, and regression diffs as a pass/fail gate."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [
+    { name = "Peter Hedman", email = "peter.mejl@gmail.com" }
+]
+keywords = ["llm", "evals", "eval", "testing", "ci", "prompts", "regression"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Quality Assurance",
+]
+dependencies = [
+    "httpx>=0.27",
+    "typer>=0.12",
+    "rich>=13.7",
+]
+
+[project.scripts]
+evaldiff = "evaldiff_cli.main:app"
+
+[project.urls]
+Homepage = "https://github.com/evaldiff/evaldiff"
+Repository = "https://github.com/evaldiff/evaldiff"
+
+[tool.hatch.build.targets.wheel]
+packages = ["evaldiff_cli"]
