@@ -32,18 +32,17 @@ so "it worked yesterday, why not today?" is a daily problem. Evaldiff sells the
 ```bash
 pip install evaldiff
 evaldiff --version
-
 ```
 
 npm (placeholder + future GitHub Action):
 
-```
+```bash
 npm i -g @evaldiff/evaldiff
 ```
 
-Quickstart
+## Quickstart
 
-```
+```bash
 # Scaffold a dataset with two example cases
 evaldiff init --name my-dataset
 
@@ -56,7 +55,8 @@ evaldiff run --dataset my-dataset.json \
 # Compare two runs and see regressions
 evaldiff diff <run-a-id> <run-b-id>
 ```
-Dataset format
+
+## Dataset format
 
 ```json
 [
@@ -69,12 +69,39 @@ Dataset format
 ]
 ```
 
-rubric is optional — a list of criteria a judge model scores 0/1 against.
-Without it, evaldiff falls back to semantic / exact similarity vs. expected.
+`rubric` is optional — a list of criteria a judge model scores 0/1 against.
+Without it, evaldiff falls back to exact / contains matching against `expected`.
 
-Supported endpoints (v0)
-Any OpenAI-compatible /chat/completions endpoint (BYO key)
-OpenAI
-Anthropic
-Everything else: bring your own adapter. Scope is the moat.
+## API (v0.0.2)
+
+The core is a small FastAPI service (`pip install evaldiff` includes it):
+
+```bash
+evaldiff-server   # uvicorn on :8000, SQLite by default
+```
+
+| Endpoint | Purpose |
+| --- | --- |
+| `POST /v1/auth/signup` | Self-serve account + API key (`eval_…`), 1k free cases/month |
+| `POST /v1/datasets` | Create a dataset from inline cases |
+| `GET  /v1/datasets/{id}` | Dataset detail |
+| `POST /v1/runs` | Score a dataset against an OpenAI-compatible endpoint (async job) |
+| `GET  /v1/runs/{id}` | Run status: `queued → running → done/failed` |
+| `GET  /v1/runs/{id}/cases` | Per-case output, score, pass/fail, tokens, error |
+| `GET  /v1/runs/{id}/diff?compare={other_id}` | Regression diff (JSON) |
+| `GET  /v1/runs/{id}/report.md?compare={other_id}` | The same as a markdown report |
+| `GET  /v1/usage` | Quota / usage for the key |
+
+Auth is a bearer `eval_…` key on every `/v1/*` call. Quota is per-account,
+per calendar month; failed runs are free.
+
+## Supported endpoints (v0)
+
+Any OpenAI-compatible `/chat/completions` endpoint (BYO key): OpenAI,
+Groq, Together, Ollama, vLLM, LM Studio. Everything else: bring your own adapter.
+
+## Status
+
+- `0.0.2` — API core: auth, datasets, runs (worker + retries), judges, diff + report
+- Next: GitHub Action (`@evaldiff/action`), web diff view, usage-based billing
 
