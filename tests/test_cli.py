@@ -1,4 +1,5 @@
 """Tests for the evaldiff CLI stub."""
+
 from __future__ import annotations
 
 import json

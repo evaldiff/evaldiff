@@ -3,6 +3,7 @@
 Stubs a small, self-serve evaluation gate: datasets, runs, and
 regression diffs exposed as a pass/fail gate for CI.
 """
+
 from __future__ import annotations
 
 import typer
