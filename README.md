@@ -1,5 +1,9 @@
 # Evaldiff
 
+[![evaldiff CI](https://github.com/evaldiff/evaldiff/actions/workflows/ci.yml/badge.svg)](https://github.com/evaldiff/evaldiff/actions/workflows/ci.yml)
+[![PyPI version](https://img.shields.io/pypi/v/evaldiff)](https://pypi.org/project/evaldiff/)
+[![npm version](https://img.shields.io/npm/v/@evaldiff/evaldiff)](https://www.npmjs.com/package/@evaldiff/evaldiff)
+
 > **CI for LLM prompts.** Datasets, eval runs, and regression diffs as a
 > pass/fail gate for your CI — the `npm test` of prompts.
 
