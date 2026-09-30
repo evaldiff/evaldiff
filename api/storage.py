@@ -47,6 +47,7 @@ class S3Storage(Storage):
         region: str = "eu-central-1",
     ) -> None:
         import boto3
+        from botocore.config import Config
 
         self._s3 = boto3.client(
             "s3",
@@ -54,7 +55,7 @@ class S3Storage(Storage):
             aws_access_key_id=access_key,
             aws_secret_access_key=secret_key,
             region_name=region,
-            config=boto3.Config(signature_version="s3v4"),
+            config=Config(signature_version="s3v4"),
         )
         self.bucket = bucket
         self._ensure_bucket()

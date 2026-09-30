@@ -9,7 +9,7 @@ from __future__ import annotations
 import typer
 from rich.console import Console
 
-__version__ = "0.0.3"
+__version__ = "0.0.4"
 
 app = typer.Typer(
     name="evaldiff",
