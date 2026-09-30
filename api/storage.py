@@ -54,7 +54,7 @@ class S3Storage(Storage):
             aws_access_key_id=access_key,
             aws_secret_access_key=secret_key,
             region_name=region,
-            config=__import__("boto3").client.Config(signature_version="s3v4"),
+            config=boto3.Config(signature_version="s3v4"),
         )
         self.bucket = bucket
         self._ensure_bucket()

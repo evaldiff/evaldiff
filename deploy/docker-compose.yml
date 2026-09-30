@@ -1,0 +1,74 @@
+name: evaldiff
+
+services:
+  # --- SeaweedFS (S3-compatible object storage) ---
+  seaweed:
+    image: chrislusf/seaweedfs:4.48
+    command: server -s3 -dir /data
+    volumes:
+      - weeddata:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:18333/status"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    # S3 listens on :8333, master :8332
+
+  # --- Postgres ---
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: evaldiff
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: evaldiff
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U evaldiff"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # --- API + worker (same process, v0) ---
+  api:
+    build: .
+    environment:
+      EVALDIFF_DATABASE_URL: postgresql+psycopg://evaldiff:${POSTGRES_PASSWORD}@db:5432/evaldiff
+      EVALDIFF_S3_ENDPOINT: http://seaweed:18333
+      EVALDIFF_S3_ACCESS_KEY: admin
+      EVALDIFF_S3_SECRET_KEY: ${SEAWEEFS_SECRET}
+      EVALDIFF_S3_BUCKET: evaldiff
+      EVALDIFF_PUBLIC_BASE_URL: https://api.evaldiff.io
+      EVALDIFF_DEFAULT_QUOTA: "1000"
+      EVALDIFF_ENABLE_WORKER: "true"
+    depends_on:
+      db:
+        condition: service_healthy
+      seaweed:
+        condition: service_started
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8000/healthz')"]
+      interval: 20s
+      timeout: 5s
+      retries: 10
+
+  # --- TLS + proxy ---
+  caddy:
+    image: caddy:2-alpine
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddydata:/data
+    depends_on:
+      - api
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  weeddata:
+  caddydata:
