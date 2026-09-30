@@ -2,7 +2,7 @@
 
 Written before sleep; picks up exactly where the security hardening stopped.
 
-## 1. DONE this session
+## 0. STATUS (as of 2026-09-30 20:00 UTC): all code shipped ✅ — see sections 1–3. Only items B (hardening) + C (product) remain.
 
 - **SSRF endpoint guard** (audit finding #1, the one to fix before launch):
   - `api/main.py`: `validate_endpoint()` + `_is_blocked_host()` block literal-IP
@@ -30,7 +30,7 @@ Written before sleep; picks up exactly where the security hardening stopped.
    - `endpoint → 127.0.0.1` (no opt-in) → **400 blocked** ✅
    - `endpoint → 127.0.0.1` + `allow_local_endpoints:true` → **202 accepted** ✅
    - `endpoint → api.openai.com` → **202 accepted** ✅
-4. Push ~/evaldiff + push ~/evaldiff-action (commit + ls-remote verify)
+4. Pushed both repos ✅ (evaldiff main a04bfb6, action main 7c34df5)
 5. Cleanup debug accounts (audit leftovers): delete API keys for
    `action-e2e-*`, `gate-test-*`, `race-*`, `auto-*`, `ssrf-*`, `fix-verify-*`, `dbg-*` @evaldiff.io
    via psql on the db container (or leave; low risk).
