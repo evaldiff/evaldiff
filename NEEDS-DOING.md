@@ -17,13 +17,13 @@ Written before sleep; picks up exactly where the security hardening stopped.
 - **GitHub action** (`~/evaldiff-action`): new `allow_local` input wired
   through action.yml → ED_ALLOW_LOCAL → run body. README updated.
 
-## 2. SHIPPED — 0.0.6 (all verified ✅)
+## 2. SHIPPED — 0.0.6 → 0.0.7 (all verified ✅)
 
-1. `pyproject` bumped to 0.0.6, built, **published to PyPI** (pypi.org/pypi/evaldiff → LATEST 0.0.6) ✅
-2. Hetzner: Dockerfile pin updated (0.0.5→0.0.6), `docker compose build+up api` ✅
-   (container runs evaldiff 0.0.6, healthy. NOTE: /health still reports
-   `__version__` from `api/__init__.py` — bump that too or switch to
-   `importlib.metadata.version("evaldiff")`.)
+1. **0.0.6 published to PyPI** (SSRF guard) ✅
+2. Hetzner: Dockerfile pin updated, `docker compose build+up api` ✅
+   (container runs 0.0.6; /health fix needed one more version — see 0.0.7 below.)
+2b. **0.0.7 shipped** (cosmetic: /health read importlib.metadata): PyPI live,
+    Hetzner running, **https://api.evaldiff.io/health → version 0.0.7** ✅
 3. **Live SSRF verification** (fresh account, 5 cases):
    - `endpoint → 169.254.169.254` → **400 blocked** ✅
    - `endpoint → 192.168.50.1` → **400 blocked** ✅
@@ -38,10 +38,8 @@ Written before sleep; picks up exactly where the security hardening stopped.
 ## 3. TO DO next (in priority order)
 
 ### A. Small code nits
-1. `api/__init__.py` /health version: now reads from importlib.metadata (code is
-   correct in tree) — but the 0.0.6 artifacts on PyPI were built BEFORE this fix,
-   so /health still reports 0.0.5. Cosmetic only. Ship with 0.0.7.
-2. Tag `v1` on evaldiff/action once the allow_local push lands.
+1. ~~`/health` version stale~~ FIXED in 0.0.7 (importlib.metadata; live reports 0.0.7) ✅
+2. Tag `v1` on evaldiff/action (pushed 7c34df5, tag not yet created).
 
 ### B. Known remaining gaps (accepted for v0, fix before scale)
 - **Hostname SSRF**: guard only blocks *literal* IPs. `http://metadata.internal`
