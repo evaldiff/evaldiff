@@ -4,7 +4,7 @@ WORKDIR /app
 
 # evaldiff 0.0.6 from PyPI (API + CLI in one package)
 # + drivers: psycopg (Postgres), boto3 (S3/SeaweedFS)
-RUN pip install --no-cache-dir evaldiff==0.0.6 "psycopg[binary]>=3.1" boto3
+RUN pip install --no-cache-dir evaldiff==0.0.7 "psycopg[binary]>=3.1" boto3
 
 # non-root
 RUN useradd -m appuser
