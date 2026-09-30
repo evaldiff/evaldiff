@@ -104,3 +104,31 @@ def fmt(v: float | None) -> str:
 
 def fmt_delta(v: float | None) -> str:
     return "—" if v is None else f"{v:+.3f}"
+
+
+def run_to_markdown(run: Run) -> str:
+    """Single-run report (no baseline)."""
+    total = len(run.cases)
+    passed = sum(1 for c in run.cases if c.passed)
+    lines = [
+        f"# evaldiff report — run {run.id} ({run.model})",
+        "",
+        "| metric | value |",
+        "|---|---|",
+        f"| avg score | {fmt(run.avg_score)} |",
+        f"| cases | {total} |",
+        f"| passed | {passed} |",
+        f"| pass rate | {f'{passed / total:.1%}' if total else '—'} |",
+        f"| status | {run.status} |",
+        "",
+    ]
+    failures = [c for c in run.cases if not c.passed]
+    if failures:
+        lines += ["## Failing cases", ""]
+        for c in failures[:20]:
+            err = f" — {c.error}" if c.error else ""
+            lines.append(f"- case {c.seq}: score {fmt(c.score)}{err}")
+        if len(failures) > 20:
+            lines.append(f"- … and {len(failures) - 20} more")
+        lines.append("")
+    return "\n".join(lines)

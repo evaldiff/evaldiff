@@ -16,7 +16,7 @@ from sqlalchemy.orm import Session
 from . import __version__
 from .auth import create_key, get_current_account
 from .db import Base, get_session, make_engine, state
-from .diff import compute_diff, diff_to_markdown
+from .diff import compute_diff, diff_to_markdown, run_to_markdown
 from .models import Account, Dataset, Run
 from .settings import Settings
 from .storage import build_storage
@@ -289,6 +289,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         account: Account = Depends(get_current_account),
         session: Session = Depends(get_session),
     ) -> dict:
+        # diff semantics: run_id = NEW run (B), compare = BASE run (A)
         run_b = _get_own_run(session, run_id, account)
         run_a = _get_own_run(session, compare, account)
         d = compute_diff(session, run_a, run_b)
@@ -302,13 +303,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.get("/v1/runs/{run_id}/report.md")
     def report(
         run_id: int,
-        compare: int,
+        compare: int | None = None,
         account: Account = Depends(get_current_account),
         session: Session = Depends(get_session),
     ) -> Response:
-        run_b = _get_own_run(session, run_id, account)
-        run_a = _get_own_run(session, compare, account)
-        md = diff_to_markdown(compute_diff(session, run_a, run_b))
+        run = _get_own_run(session, run_id, account)
+        if compare is None:
+            md = run_to_markdown(run)
+        else:
+            # diff semantics: run_id = NEW run (B), compare = BASE run (A)
+            run_a = _get_own_run(session, compare, account)
+            md = diff_to_markdown(compute_diff(session, run_a, run))
         return Response(content=md, media_type="text/markdown")
 
     # ---------- usage ----------
