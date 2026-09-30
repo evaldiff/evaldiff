@@ -4,6 +4,11 @@ from __future__ import annotations
 
 import time
 
+import pytest
+from starlette.testclient import TestClient
+
+from api.db import state
+
 
 def _wait_for(client, key: str, path: str, want: str, timeout: float = 20.0) -> dict:
     deadline = time.time() + timeout
@@ -46,6 +51,92 @@ def test_requires_auth(client) -> None:
         == 401
     )
     assert client.get("/v1/usage").status_code == 401
+
+
+# ---------- SSRF endpoint guard ----------
+def _make_ssrf_app(tmp_path, *, allow_local: bool):
+    from api.main import create_app
+    from api.settings import Settings
+
+    return create_app(
+        Settings(
+            database_url=f"sqlite:///{tmp_path}/ssrf.db",
+            enable_worker=False,
+            allow_local_endpoints=allow_local,
+        )
+    )
+
+
+@pytest.fixture()
+def ssrf_client(tmp_path, client):
+    """Prod-like client: self-hosted endpoints blocked by default."""
+    app = _make_ssrf_app(tmp_path, allow_local=False)
+    with TestClient(app) as c:
+        yield c
+    state.session_factory = None
+    state.storage = None
+
+
+@pytest.fixture()
+def ssrf_client_optin(tmp_path, echo_model):
+    """App client with self-hosted endpoints allowed."""
+    app = _make_ssrf_app(tmp_path, allow_local=True)
+    with TestClient(app) as c:
+        yield c
+    state.session_factory = None
+    state.storage = None
+
+
+def test_endpoint_ssrf_blocked_by_default(ssrf_client) -> None:
+    client = ssrf_client
+    key = client.post("/v1/auth/signup", json={"email": "ssrf@example.com"}).json()["key"]
+    headers = {"Authorization": f"Bearer {key}"}
+    ds = client.post(
+        "/v1/datasets",
+        headers=headers,
+        json={"name": "d", "cases": [{"input": "hi", "expected": "hi"}]},
+    ).json()
+    for evil in (
+        "http://169.254.169.254/latest/meta-data",  # cloud metadata
+        "http://127.0.0.1:9999/v1",  # loopback
+        "http://10.0.0.5/v1",  # RFC1918
+        "http://[::1]/v1",  # IPv6 loopback
+    ):
+        r = client.post(
+            "/v1/runs",
+            headers=headers,
+            json={
+                "dataset_id": ds["id"],
+                "model": "m",
+                "endpoint": evil,
+            },
+        )
+        assert r.status_code == 400, f"{evil} -> {r.status_code} {r.text}"
+        assert "blocked" in r.json()["detail"]
+    # public endpoints still accepted
+    r = client.post(
+        "/v1/runs",
+        headers=headers,
+        json={"dataset_id": ds["id"], "model": "m", "endpoint": "https://api.openai.com/v1"},
+    )
+    assert r.status_code == 202, r.text
+
+
+def test_endpoint_ssrf_opt_in(ssrf_client_optin, echo_model) -> None:
+    client = ssrf_client_optin
+    key = client.post("/v1/auth/signup", json={"email": "optin@example.com"}).json()["key"]
+    headers = {"Authorization": f"Bearer {key}"}
+    ds = client.post(
+        "/v1/datasets",
+        headers=headers,
+        json={"name": "d", "cases": [{"input": "hi", "expected": "hi"}]},
+    ).json()
+    r = client.post(
+        "/v1/runs",
+        headers=headers,
+        json={"dataset_id": ds["id"], "model": "m", "endpoint": echo_model},
+    )
+    assert r.status_code == 202, r.text
 
 
 def test_dataset_validation(client) -> None:

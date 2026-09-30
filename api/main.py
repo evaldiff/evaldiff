@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import ipaddress
 import json
 import time
 from datetime import datetime
 from typing import Any
+from urllib.parse import urlparse
 
 from fastapi import Depends, FastAPI, HTTPException, Response, status
 from pydantic import BaseModel, Field
@@ -53,6 +55,8 @@ class RunIn(BaseModel):
     api_key: str = ""
     prompt_template: str = "{{ input }}"
     threshold: float = Field(default=0.8, ge=0.0, le=1.0)
+    # Per-request opt-in for self-hosted model servers on loopback/LAN ranges.
+    allow_local_endpoints: bool = False
 
 
 class RunOut(BaseModel):
@@ -94,6 +98,44 @@ def _run_out(run: Run) -> RunOut:
         error=run.error,
         created_at=run.created_at,
     )
+
+
+def _split_endpoint(endpoint: str) -> tuple[str, int | None]:
+    """Return (host, port) for an endpoint URL; raise ValueError on bad input."""
+    parts = urlparse(endpoint)
+    if parts.scheme not in ("http", "https") or not parts.hostname:
+        raise ValueError("endpoint must be an http(s) URL")
+    return parts.hostname, parts.port
+
+
+def _is_blocked_host(host: str) -> bool:
+    """True for literal IPs in ranges we never call by default (SSRF guard).
+
+    Hostnames are allowed: they must resolve through a normal client DNS and
+    are out of scope for the literal-IP check (see NEEDS-DOING.md, "Later").
+    """
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return (
+        ip.is_private
+        or ip.is_loopback
+        or ip.is_link_local
+        or ip.is_reserved
+        or ip.is_multicast
+    )
+
+
+def validate_endpoint(endpoint: str, allow_local: bool) -> str:
+    host, _port = _split_endpoint(endpoint)
+    if not allow_local and _is_blocked_host(host):
+        raise ValueError(
+            f"endpoint host '{host}' is a private/loopback address and is blocked "
+            "on this deployment; point at a public endpoint or set "
+            "allow_local_endpoints=true (self-hosted model servers only)"
+        )
+    return endpoint
 
 
 # ---------- app factory ----------
@@ -217,6 +259,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         ds = session.get(Dataset, body.dataset_id)
         if ds is None or ds.account_id != account.id:
             raise HTTPException(404, "dataset not found")
+        try:
+            validate_endpoint(body.endpoint, body.allow_local_endpoints or settings.allow_local_endpoints)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc))
         period = time.strftime("%Y-%m")
         if account.quota_period != period:
             account.quota_period = period

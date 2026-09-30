@@ -23,3 +23,8 @@ class Settings(BaseSettings):
 
     max_cases_per_dataset: int = 5000
     max_dataset_bytes: int = 10_000_000
+
+    # Allow run endpoints that point at loopback / private / reserved address
+    # ranges (self-hosted model servers on the same machine or LAN). Off by
+    # default so public deployments cannot be used to probe internal services.
+    allow_local_endpoints: bool = False
