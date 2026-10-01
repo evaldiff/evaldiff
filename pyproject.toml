@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "evaldiff"
-version = "0.0.7"
+version = "0.0.8"
 description = "CI for LLM prompts: datasets, eval runs, and regression diffs as a pass/fail gate."
 readme = "README.md"
 requires-python = ">=3.10"

@@ -55,8 +55,6 @@ class RunIn(BaseModel):
     api_key: str = ""
     prompt_template: str = "{{ input }}"
     threshold: float = Field(default=0.8, ge=0.0, le=1.0)
-    # Per-request opt-in for self-hosted model servers on loopback/LAN ranges.
-    allow_local_endpoints: bool = False
 
 
 class RunOut(BaseModel):
@@ -132,8 +130,9 @@ def validate_endpoint(endpoint: str, allow_local: bool) -> str:
     if not allow_local and _is_blocked_host(host):
         raise ValueError(
             f"endpoint host '{host}' is a private/loopback address and is blocked "
-            "on this deployment; point at a public endpoint or set "
-            "allow_local_endpoints=true (self-hosted model servers only)"
+            "on this deployment; point at a public endpoint, or ask the deployment "
+            "administrator to enable EVALDIFF_ALLOW_LOCAL_ENDPOINTS for "
+            "self-hosted model servers"
         )
     return endpoint
 
@@ -176,12 +175,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.post("/v1/auth/signup", response_model=SignupOut, status_code=status.HTTP_201_CREATED)
     def signup(body: SignupIn, session: Session = Depends(get_session)) -> SignupOut:
         email = body.email.strip().lower()
-        account = session.query(Account).filter(Account.email == email).first()
-        if account is None:
-            account = Account(email=email, monthly_quota=settings.default_quota)
-            session.add(account)
-            session.commit()
-            session.refresh(account)
+        existing = session.query(Account).filter(Account.email == email).first()
+        if existing is not None:
+            # Never issue a key for an account the caller cannot authenticate to.
+            # (Account takeover: knowing a victim's email must not grant access.)
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                "an account with this email already exists; "
+                "authenticate with your existing API key instead",
+            )
+        account = Account(email=email, monthly_quota=settings.default_quota)
+        session.add(account)
+        session.commit()
+        session.refresh(account)
         key, _ = create_key(session, account, label="default")
         return SignupOut(key=key, email=email, quota=account.monthly_quota)
 
@@ -260,19 +266,26 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if ds is None or ds.account_id != account.id:
             raise HTTPException(404, "dataset not found")
         try:
-            validate_endpoint(body.endpoint, body.allow_local_endpoints or settings.allow_local_endpoints)
+            # SSRF policy is a deployment-administrator decision: the
+            # EVALDIFF_ALLOW_LOCAL_ENDPOINTS env var only. Callers cannot
+            # override it per-request.
+            validate_endpoint(body.endpoint, settings.allow_local_endpoints)
         except ValueError as exc:
             raise HTTPException(400, str(exc))
         period = time.strftime("%Y-%m")
         if account.quota_period != period:
             account.quota_period = period
             account.used_cases = 0
+        # Reserve the full dataset size atomically at enqueue time. Without
+        # this, several queued runs could each pass the "used < quota" check
+        # before any of them finishes, collectively blowing the quota.
         if account.used_cases + ds.case_count > account.monthly_quota:
             raise HTTPException(
                 status.HTTP_429_TOO_MANY_REQUESTS,
                 "monthly case quota exceeded",
                 headers={"Retry-After": "86400"},
             )
+        account.used_cases += ds.case_count
         run = Run(
             account_id=account.id,
             dataset_id=ds.id,

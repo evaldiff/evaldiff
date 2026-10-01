@@ -27,4 +27,6 @@ class Settings(BaseSettings):
     # Allow run endpoints that point at loopback / private / reserved address
     # ranges (self-hosted model servers on the same machine or LAN). Off by
     # default so public deployments cannot be used to probe internal services.
+    # Deployment-administrator controlled only (env var EVALDIFF_ALLOW_LOCAL_ENDPOINTS);
+    # API callers have no way to override this per-request.
     allow_local_endpoints: bool = False

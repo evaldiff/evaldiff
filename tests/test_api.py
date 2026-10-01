@@ -36,10 +36,14 @@ def test_signup_returns_key(client) -> None:
     assert body["key"].startswith("eval_")
     assert body["email"] == "dev@example.com"
     assert body["quota"] >= 1000
-    # second signup reuses the account
-    r2 = client.post("/v1/auth/signup", json={"email": "dev@example.com"})
-    assert r2.status_code == 201
-    assert r2.json()["email"] == "dev@example.com"
+
+
+def test_signup_duplicate_email_rejected(client) -> None:
+    """P1: signup must never issue a key for an existing account (takeover)."""
+    assert client.post("/v1/auth/signup", json={"email": "dup@example.com"}).status_code == 201
+    r = client.post("/v1/auth/signup", json={"email": "dup@example.com"})
+    assert r.status_code == 409
+    assert "key" not in r.json()
 
 
 def test_requires_auth(client) -> None:
@@ -123,6 +127,7 @@ def test_endpoint_ssrf_blocked_by_default(ssrf_client) -> None:
 
 
 def test_endpoint_ssrf_opt_in(ssrf_client_optin, echo_model) -> None:
+    """Server-side allow (deployment admin) still works."""
     client = ssrf_client_optin
     key = client.post("/v1/auth/signup", json={"email": "optin@example.com"}).json()["key"]
     headers = {"Authorization": f"Bearer {key}"}
@@ -137,6 +142,31 @@ def test_endpoint_ssrf_opt_in(ssrf_client_optin, echo_model) -> None:
         json={"dataset_id": ds["id"], "model": "m", "endpoint": echo_model},
     )
     assert r.status_code == 202, r.text
+
+
+def test_endpoint_ssrf_caller_cannot_override(ssrf_client, echo_model) -> None:
+    """P1: a caller cannot override the SSRF policy per-request, even by
+    sending allow_local_endpoints in the body (server env var is the only
+    switch)."""
+    client = ssrf_client
+    key = client.post("/v1/auth/signup", json={"email": "override@example.com"}).json()["key"]
+    headers = {"Authorization": f"Bearer {key}"}
+    ds = client.post(
+        "/v1/datasets",
+        headers=headers,
+        json={"name": "d", "cases": [{"input": "hi", "expected": "hi"}]},
+    ).json()
+    r = client.post(
+        "/v1/runs",
+        headers=headers,
+        json={
+            "dataset_id": ds["id"],
+            "model": "m",
+            "endpoint": echo_model,  # 127.0.0.1 — blocked on this deployment
+            "allow_local_endpoints": True,  # caller attempt to override
+        },
+    )
+    assert r.status_code == 400, f"override succeeded: {r.status_code} {r.text}"
 
 
 def test_dataset_validation(client) -> None:
@@ -317,3 +347,152 @@ def test_diff_markdown_contains_regressions(client, echo_model) -> None:
         f"/v1/runs/{r_strict}/report.md", headers=headers, params={"compare": r_loose}
     ).text
     assert "Regressions" in md
+
+
+# ---------- P1/P2: errored cases, failed runs, quota reservation ----------
+def test_diff_treats_erred_b_as_regression(client, echo_model) -> None:
+    """P1: a case that passed in A but ERRORED (or is missing) in B is a
+    regression, not invisible."""
+    key = client.post("/v1/auth/signup", json={"email": "errdiff@example.com"}).json()["key"]
+    headers = {"Authorization": f"Bearer {key}"}
+    ds = client.post(
+        "/v1/datasets",
+        headers=headers,
+        json={
+            "name": "d",
+            "cases": [
+                {"input": "What is 2+2?", "expected": "4"},
+                {"input": "capital of France?", "expected": "France"},
+            ],
+        },
+    ).json()
+    # run A: threshold 0 — echo repeats the prompt (which contains the
+    # question, not the answer), so force pass with threshold 0 (any score).
+    ra = client.post(
+        "/v1/runs",
+        headers=headers,
+        json={"dataset_id": ds["id"], "model": "echo", "endpoint": echo_model, "threshold": 0.0},
+    ).json()["id"]
+    ra_id = _wait_for(client, key, f"/v1/runs/{ra}", "done")["id"]
+    # both cases passed in A (threshold 0, echo always scores >= 0)
+    cases_a = client.get(f"/v1/runs/{ra_id}/cases", headers=headers).json()
+    assert all(c["passed"] is True for c in cases_a), cases_a
+
+    # run B: endpoint refuses the connection -> every case errors (passed=None)
+    rb = client.post(
+        "/v1/runs",
+        headers=headers,
+        json={
+            "dataset_id": ds["id"],
+            "model": "echo",
+            "endpoint": "http://127.0.0.1:1/v1",  # connection refused
+            "threshold": 0.0,
+        },
+    )
+    assert rb.status_code == 202, rb.text
+    rb_id = rb.json()["id"]
+    rb = _wait_for(client, key, f"/v1/runs/{rb_id}", "done")
+    cases_b = client.get(f"/v1/runs/{rb_id}/cases", headers=headers).json()
+    assert all(c["error"] for c in cases_b), cases_b  # both errored
+
+    d = client.get(f"/v1/runs/{rb_id}/diff", headers=headers, params={"compare": ra_id}).json()
+    assert d["summary"]["regressions"] == 2, d["summary"]
+    notes = {c["note"] for c in d["regressions"]}
+    assert any("errored" in n for n in notes), notes
+
+
+def test_failed_run_persists_status_and_refunds(client, echo_model) -> None:
+    """P2: a run that fails (dataset unreadable) must persist status='failed'
+    with an error, and release its quota reservation (no charge)."""
+    key = client.post("/v1/auth/signup", json={"email": "failrun@example.com"}).json()["key"]
+    headers = {"Authorization": f"Bearer {key}"}
+    ds = client.post(
+        "/v1/datasets",
+        headers=headers,
+        json={"name": "d", "cases": [{"input": "i", "expected": "e"}]},
+    ).json()
+
+    # corrupt the stored payload so the worker cannot load it
+    from api.db import state as _state
+
+    sf = _state.session_factory()
+    from api.models import Dataset as _DS
+
+    row = sf.get(_DS, ds["id"])
+    row.cases_json = '"not-a-list"'
+    sf.commit()
+    sf.close()
+
+    r = client.post(
+        "/v1/runs",
+        headers=headers,
+        json={"dataset_id": ds["id"], "model": "echo", "endpoint": echo_model, "threshold": 0.0},
+    )
+    assert r.status_code == 202, r.text
+    rid = r.json()["id"]
+
+    last = _wait_for(client, key, f"/v1/runs/{rid}", "failed")
+    assert last["error"], last  # P2: error is persisted, not lost
+    usage = client.get("/v1/usage", headers=headers).json()
+    assert usage["used"] == 0, usage  # failed run is free (reservation released)
+
+
+def test_quota_reserved_at_enqueue(client, echo_model) -> None:
+    """P2: quota is reserved when the run is QUEUED, not when it finishes —
+    two 600-case runs cannot both pass the check against a 1000-case quota."""
+    key = client.post("/v1/auth/signup", json={"email": "reserve@example.com"}).json()["key"]
+    headers = {"Authorization": f"Bearer {key}"}
+    cases = [{"input": f"q{i}", "expected": f"e{i}"} for i in range(600)]
+    ds = client.post("/v1/datasets", headers=headers, json={"name": "big", "cases": cases}).json()
+    r1 = client.post(
+        "/v1/runs",
+        headers=headers,
+        json={"dataset_id": ds["id"], "model": "echo", "endpoint": echo_model, "threshold": 0.0},
+    )
+    assert r1.status_code == 202, r1.text
+    # immediately (run 1 may still be queued/running): the reservation blocks
+    # run 2 even though nothing has been settled yet
+    r2 = client.post(
+        "/v1/runs",
+        headers=headers,
+        json={"dataset_id": ds["id"], "model": "echo", "endpoint": echo_model, "threshold": 0.0},
+    )
+    assert r2.status_code == 429, f"reservation not enforced: {r2.status_code} {r2.text}"
+    r1 = _wait_for(client, key, f"/v1/runs/{r1.json()['id']}", "done")
+    usage = client.get("/v1/usage", headers=headers).json()
+    assert usage["used"] == 600, usage  # exactly the one run that succeeded
+
+
+def test_erred_cases_not_charged(client) -> None:
+    """P2: cases where the model call failed are not billed, even though the
+    run itself reaches 'done'."""
+    key = client.post("/v1/auth/signup", json={"email": "nocharge@example.com"}).json()["key"]
+    headers = {"Authorization": f"Bearer {key}"}
+    ds = client.post(
+        "/v1/datasets",
+        headers=headers,
+        json={
+            "name": "d",
+            "cases": [
+                {"input": "a", "expected": "a"},
+                {"input": "b", "expected": "b"},
+            ],
+        },
+    ).json()
+    r = client.post(
+        "/v1/runs",
+        headers=headers,
+        json={
+            "dataset_id": ds["id"],
+            "model": "echo",
+            "endpoint": "http://127.0.0.1:1/v1",  # every model call fails
+            "threshold": 0.0,
+        },
+    )
+    assert r.status_code == 202, r.text
+    rid = r.json()["id"]
+    r = _wait_for(client, key, f"/v1/runs/{rid}", "done")
+    cases = client.get(f"/v1/runs/{rid}/cases", headers=headers).json()
+    assert all(c["error"] for c in cases), cases
+    usage = client.get("/v1/usage", headers=headers).json()
+    assert usage["used"] == 0, usage  # 0 OK cases -> 0 charged

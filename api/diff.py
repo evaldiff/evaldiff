@@ -62,8 +62,16 @@ def compute_diff(session: Session, a: Run, b: Run, regression_drop: float = 0.1)
         )
         regression = False
         note = ""
-        if a_passed is True and b_passed is False:
-            regression, note = True, "new failure"
+        # A previously-passing case that no longer passes — including a
+        # timeout/execution error (b_passed is None) or a missing result —
+        # is a regression.
+        if a_passed is True and b_passed is not True:
+            if cb is None:
+                regression, note = True, "missing in new run"
+            elif cb.passed is None:
+                regression, note = True, f"errored: {cb.error or 'execution error'}"
+            else:
+                regression, note = True, "new failure"
         elif a_score is not None and b_score is not None and (b_score - a_score) < -regression_drop:
             regression, note = True, f"score drop {delta:+.2f}"
         if regression:

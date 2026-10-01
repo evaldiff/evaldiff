@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import time
 from datetime import datetime, timezone
@@ -70,8 +71,11 @@ async def execute_run(run_id: int) -> None:
         )
         cases = cases if isinstance(cases, list) else cases.get("cases", [])
 
-        # Quota: charged on success; a failed run is free (refund).
-        charged = 0
+        # Quota: the full dataset size was RESERVED at enqueue time (see
+        # create_run). At settle we replace the reservation with the actual
+        # charge: only cases that executed OK are billed. A failed run
+        # releases its reservation entirely (refund).
+        ok_cases = 0
 
         async with httpx.AsyncClient() as client:
             for seq, case in enumerate(cases):
@@ -109,15 +113,15 @@ async def execute_run(run_id: int) -> None:
                             f"runs/{run.id}/case_{seq}/output.json",
                             {"output": output, "score": score.__dict__},
                         )
+                    ok_cases += 1
                 except Exception as exc:  # noqa: BLE001
+                    # Execution error: case is not charged (see _settle).
                     row.error = f"{type(exc).__name__}: {exc}"
                 session.add(row)
                 session.flush()
-                charged += 1
 
-        # settle quota: charged on success, free on failure
-        session.commit()
-        _settle(session, run, charged, success=True)
+        # settle: swap reservation for actual charge (only OK cases billed)
+        _settle(session, run, charged=ok_cases, reserved=len(cases), success=True)
         run.status = "done"
         run.finished_at = datetime.now(timezone.utc).replace(tzinfo=None)
         cases_rows = session.query(RunCase).filter(RunCase.run_id == run.id).all()
@@ -129,9 +133,13 @@ async def execute_run(run_id: int) -> None:
         session.commit()
     except Exception as exc:  # noqa: BLE001
         if run is not None:
-            _settle(session, run, 0, success=False, error=f"{type(exc).__name__}: {exc}")
+            with contextlib.suppress(Exception):  # rollback may fail if connection is dead
+                session.rollback()
+            # Release the quota reservation (failed runs are free) and
+            # PERSIST the terminal status — commit before the session closes.
             run.status = "failed"
             run.error = f"{type(exc).__name__}: {exc}"
+            _settle(session, run, charged=0, reserved=run.total_cases or 0, success=False, error=run.error)
     finally:
         session.close()
 
@@ -140,19 +148,23 @@ def _settle(
     session: Session,
     run: Run,
     charged: int,
+    reserved: int,
     success: bool,
     error: str = "",
 ) -> None:
-    """v0 billing: a run is charged on success, free on failure."""
+    """v0 billing: the dataset size is reserved at enqueue. On success the
+    reservation is swapped for the actual charge (OK cases only); on failure
+    the reservation is released entirely (refund)."""
     account = run.account
     period = time.strftime("%Y-%m")
     if account.quota_period != period:
         account.quota_period = period
         account.used_cases = 0
+    if reserved:
+        account.used_cases = max(0, account.used_cases - reserved)
     if success:
         account.used_cases += charged
         run.total_cost_usd = 0.0  # metered by usage; cost accounting in v1
-    # on failure: nothing charged (refund policy)
     if error:
         run.error = error
     session.commit()
