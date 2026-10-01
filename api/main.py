@@ -13,6 +13,7 @@ from urllib.parse import urlparse
 
 from fastapi import Depends, FastAPI, HTTPException, Response, status
 from pydantic import BaseModel, Field
+from sqlalchemy import case, update
 from sqlalchemy.orm import Session
 
 from . import __version__
@@ -116,13 +117,7 @@ def _is_blocked_host(host: str) -> bool:
         ip = ipaddress.ip_address(host)
     except ValueError:
         return False
-    return (
-        ip.is_private
-        or ip.is_loopback
-        or ip.is_link_local
-        or ip.is_reserved
-        or ip.is_multicast
-    )
+    return ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast
 
 
 def validate_endpoint(endpoint: str, allow_local: bool) -> str:
@@ -273,19 +268,22 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         except ValueError as exc:
             raise HTTPException(400, str(exc))
         period = time.strftime("%Y-%m")
-        if account.quota_period != period:
-            account.quota_period = period
-            account.used_cases = 0
-        # Reserve the full dataset size atomically at enqueue time. Without
-        # this, several queued runs could each pass the "used < quota" check
-        # before any of them finishes, collectively blowing the quota.
-        if account.used_cases + ds.case_count > account.monthly_quota:
+        # Check and reserve against the database value in one statement;
+        # the account loaded during authentication may already be stale.
+        used = case((Account.quota_period == period, Account.used_cases), else_=0)
+        reservation = session.execute(
+            update(Account)
+            .where(Account.id == account.id, used + ds.case_count <= Account.monthly_quota)
+            .values(used_cases=used + ds.case_count, quota_period=period)
+            .execution_options(synchronize_session=False)
+        )
+        if reservation.rowcount != 1:
+            session.rollback()
             raise HTTPException(
                 status.HTTP_429_TOO_MANY_REQUESTS,
                 "monthly case quota exceeded",
                 headers={"Retry-After": "86400"},
             )
-        account.used_cases += ds.case_count
         run = Run(
             account_id=account.id,
             dataset_id=ds.id,
@@ -298,9 +296,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             total_cases=ds.case_count,
         )
         session.add(run)
-        session.commit()
-        session.refresh(run)
+        session.flush()
+        # enqueue_run commits the reservation, run, and job together.
         enqueue_run(session, run.id)
+        session.refresh(run)
         return _run_out(run)
 
     @app.get("/v1/runs", response_model=list[RunOut])

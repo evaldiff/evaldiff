@@ -496,3 +496,130 @@ def test_erred_cases_not_charged(client) -> None:
     assert all(c["error"] for c in cases), cases
     usage = client.get("/v1/usage", headers=headers).json()
     assert usage["used"] == 0, usage  # 0 OK cases -> 0 charged
+
+
+@pytest.mark.parametrize("case_count, expected_statuses", [(600, [202, 429]), (400, [202, 202])])
+def test_concurrent_runs_cannot_overbook_quota(tmp_path, case_count, expected_statuses) -> None:
+    """Concurrent reservations respect the limit without losing valid usage."""
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+
+    from fastapi import Depends, Header
+
+    from api.auth import get_current_account
+    from api.db import get_session
+    from api.main import create_app
+    from api.models import Job
+    from api.settings import Settings
+
+    app = create_app(
+        Settings(
+            database_url=f"sqlite:///{tmp_path}/concurrent-quota.db",
+            default_quota=1000,
+            enable_worker=False,
+        )
+    )
+    both_authenticated = Barrier(2, timeout=10)
+
+    def synchronized_account(
+        authorization: str | None = Header(default=None),
+        session=Depends(get_session),
+    ):
+        account = get_current_account(authorization=authorization, session=session)
+        # Each request has its own real session and has read the same account
+        # before either can reserve quota. No sleeps or mocked quota writes.
+        both_authenticated.wait()
+        return account
+
+    try:
+        with TestClient(app) as client:
+            signup = client.post("/v1/auth/signup", json={"email": "race@example.com"})
+            assert signup.status_code == 201, signup.text
+            headers = {"Authorization": f"Bearer {signup.json()['key']}"}
+            dataset = client.post(
+                "/v1/datasets",
+                headers=headers,
+                json={"name": "big", "cases": [{"input": "i", "expected": "e"}] * case_count},
+            )
+            assert dataset.status_code == 201, dataset.text
+            payload = {
+                "dataset_id": dataset.json()["id"],
+                "model": "unused",
+                "endpoint": "https://example.com/v1",
+            }
+            app.dependency_overrides[get_current_account] = synchronized_account
+            try:
+                with ThreadPoolExecutor(max_workers=2) as pool:
+                    requests = [
+                        pool.submit(client.post, "/v1/runs", headers=headers, json=payload)
+                        for _ in range(2)
+                    ]
+                    responses = [request.result(timeout=20) for request in requests]
+            finally:
+                app.dependency_overrides.clear()
+
+            assert sorted(r.status_code for r in responses) == expected_statuses, [
+                (r.status_code, r.json()) for r in responses
+            ]
+            runs = client.get("/v1/runs", headers=headers).json()
+            accepted = expected_statuses.count(202)
+            assert len(runs) == accepted
+            assert all(run["status"] == "queued" for run in runs)
+            usage = client.get("/v1/usage", headers=headers).json()
+            assert usage["used"] == accepted * case_count, usage
+            assert usage["remaining"] == 1000 - accepted * case_count, usage
+            with state.session_factory() as session:
+                assert session.query(Job).count() == accepted
+    finally:
+        state.session_factory = None
+        state.storage = None
+
+
+@pytest.mark.parametrize("success, charged", [(True, 200), (False, 0)])
+def test_settlement_preserves_new_reservations(tmp_path, success, charged) -> None:
+    """A refund must not overwrite reservations made after the account was read."""
+    from sqlalchemy import update
+    from sqlalchemy.orm import sessionmaker
+
+    from api.db import Base, make_engine
+    from api.models import Account, Dataset, Run
+    from api.runner import _settle
+
+    engine = make_engine(f"sqlite:///{tmp_path}/settlement.db")
+    Base.metadata.create_all(engine)
+    sessions = sessionmaker(bind=engine)
+    try:
+        with sessions() as session:
+            account = Account(
+                email="settlement@example.com",
+                monthly_quota=1000,
+                used_cases=600,
+                quota_period=time.strftime("%Y-%m"),
+            )
+            dataset = Dataset(account=account, name="d", case_count=600, cases_json="[]")
+            run = Run(
+                account=account, dataset=dataset, model="unused", endpoint="https://example.com"
+            )
+            session.add(run)
+            session.commit()
+            run_id = run.id
+
+        with sessions() as worker:
+            run = worker.get(Run, run_id)
+            stale_account = run.account
+            assert stale_account.used_cases == 600
+            # Another request reserves 300 cases after the worker reads usage.
+            with sessions() as request:
+                request.execute(
+                    update(Account)
+                    .where(Account.id == run.account_id)
+                    .values(used_cases=Account.used_cases + 300)
+                )
+                request.commit()
+            _settle(worker, run, charged=charged, reserved=600, success=success)
+
+        with sessions() as session:
+            account = session.query(Account).one()
+            assert account.used_cases == 300 + charged
+    finally:
+        engine.dispose()

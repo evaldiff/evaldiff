@@ -9,11 +9,12 @@ import time
 from datetime import datetime, timezone
 
 import httpx
+from sqlalchemy import case, update
 from sqlalchemy.orm import Session
 
 from .db import state
 from .judges import score_case
-from .models import Run, RunCase
+from .models import Account, Run, RunCase
 
 
 async def call_model(
@@ -121,7 +122,7 @@ async def execute_run(run_id: int) -> None:
                 session.flush()
 
         # settle: swap reservation for actual charge (only OK cases billed)
-        _settle(session, run, charged=ok_cases, reserved=len(cases), success=True)
+        reserved = run.total_cases
         run.status = "done"
         run.finished_at = datetime.now(timezone.utc).replace(tzinfo=None)
         cases_rows = session.query(RunCase).filter(RunCase.run_id == run.id).all()
@@ -130,7 +131,7 @@ async def execute_run(run_id: int) -> None:
         run.passed_cases = len(passed)
         scored = [r for r in cases_rows if r.score is not None]
         run.avg_score = round(sum(r.score for r in scored) / len(scored), 4) if scored else None
-        session.commit()
+        _settle(session, run, charged=ok_cases, reserved=reserved, success=True)
     except Exception as exc:  # noqa: BLE001
         if run is not None:
             with contextlib.suppress(Exception):  # rollback may fail if connection is dead
@@ -139,7 +140,14 @@ async def execute_run(run_id: int) -> None:
             # PERSIST the terminal status — commit before the session closes.
             run.status = "failed"
             run.error = f"{type(exc).__name__}: {exc}"
-            _settle(session, run, charged=0, reserved=run.total_cases or 0, success=False, error=run.error)
+            _settle(
+                session,
+                run,
+                charged=0,
+                reserved=run.total_cases or 0,
+                success=False,
+                error=run.error,
+            )
     finally:
         session.close()
 
@@ -155,15 +163,19 @@ def _settle(
     """v0 billing: the dataset size is reserved at enqueue. On success the
     reservation is swapped for the actual charge (OK cases only); on failure
     the reservation is released entirely (refund)."""
-    account = run.account
     period = time.strftime("%Y-%m")
-    if account.quota_period != period:
-        account.quota_period = period
-        account.used_cases = 0
-    if reserved:
-        account.used_cases = max(0, account.used_cases - reserved)
+    used = case((Account.quota_period == period, Account.used_cases), else_=0)
+    remaining = case((used >= reserved, used - reserved), else_=0)
+    session.execute(
+        update(Account)
+        .where(Account.id == run.account_id)
+        .values(
+            used_cases=remaining + (charged if success else 0),
+            quota_period=period,
+        )
+        .execution_options(synchronize_session=False)
+    )
     if success:
-        account.used_cases += charged
         run.total_cost_usd = 0.0  # metered by usage; cost accounting in v1
     if error:
         run.error = error
