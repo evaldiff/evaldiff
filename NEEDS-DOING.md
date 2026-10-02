@@ -2,7 +2,17 @@
 
 Written before sleep; picks up exactly where the security hardening stopped.
 
-## 0. STATUS (as of 2026-10-01 17:45 UTC): 0.0.8 SHIPPED — all 6 audit findings fixed, live-verified ✅
+## 0. STATUS (as of 2026-10-02 13:00 UTC): 0.0.9 SHIPPED — all 6 audit findings fixed + quota-race fix (d9c43af) ✅
+
+### SHIPPED 0.0.9 (2026-10-02)
+- **Quota reservation race fix** (Peter's commit d9c43af, reviewed + verified):
+  `create_run` now checks and reserves in ONE conditional `UPDATE` — a stale
+  ORM account row can't double-spend quota. `_settle` refunds/charges via a
+  relative `UPDATE` too. 2 new tests (4×600 concurrent → only 1 accepted;
+  refund must not clobber later reservations). **Live-verified on 0.0.9:**
+  600-case run → usage 600/400 immediately while still `queued`; 2nd 500-case
+  run → **429**; 2nd signup → **409**.
+- CI green on d9c43af: ruff check + format + 22 tests (py3.10/3.11/3.12) + build + npm smoke — 6/6 jobs ✅
 
 ### SHIPPED 0.0.8 (security fixes from the P1/P2 audit)
 1. **[P1] Signup takeover** — `POST /v1/auth/signup` now returns **409** when
