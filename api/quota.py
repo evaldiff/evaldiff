@@ -117,11 +117,6 @@ def reserve(
     under Postgres MVCC (SQLite ignores FOR UPDATE; its write lock
     already serializes).
     """
-    if session.bind.dialect.name == "postgresql":
-        session.execute(
-            text("SELECT 1 FROM accounts WHERE id = :aid FOR UPDATE"), {"aid": account_id}
-        )
-    # (SQLite serializes on its own write lock — no FOR UPDATE syntax there.)
     sql = (
         "INSERT INTO run_reservations "
         "(run_id, account_id, period, reserved, charged, settled, created_at) "
@@ -130,19 +125,34 @@ def reserve(
         "FROM run_reservations WHERE account_id = :account_id AND period = :period) "
         "+ :case_count <= :quota"
     )
-    result = session.execute(
-        text(sql),
-        {
-            "run_id": run_id,
-            "account_id": account_id,
-            "period": period,
-            "case_count": case_count,
-            "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "quota": quota,
-        },
-    )
-    session.commit()
-    return (result.rowcount or 0) == 1
+    params = {
+        "run_id": run_id,
+        "account_id": account_id,
+        "period": period,
+        "case_count": case_count,
+        "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "quota": quota,
+    }
+    if session.bind.dialect.name == "postgresql":
+        # Per-account row lock serializes concurrent reservations under
+        # MVCC; the conditional INSERT's WHERE clause then sees committed
+        # state at commit time.
+        session.execute(
+            text("SELECT 1 FROM accounts WHERE id = :aid FOR UPDATE"), {"aid": account_id}
+        )
+    # SQLite: the caller's transaction is SERIALIZABLE (BEGIN IMMEDIATE,
+    # see api/db.make_engine) — it holds the write lock from its first
+    # statement, so a concurrent reservation commits (or is rejected)
+    # BEFORE ours reads the ledger. The WHERE clause then sees committed
+    # state and exactly one of the two passes. No read-then-write race.
+    result = session.execute(text(sql), params)
+    if (result.rowcount or 0) == 1:
+        session.commit()
+        return True
+    # Rejected: roll back so the caller's pending rows (e.g. the flushed
+    # Run) never get committed — the endpoint returns 429 and discards.
+    session.rollback()
+    return False
 
 
 def settle_run(session: Session, *, run_id: int, charged: int, success: bool) -> bool:

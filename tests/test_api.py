@@ -8,6 +8,7 @@ import pytest
 from starlette.testclient import TestClient
 
 from api.db import state
+from sqlalchemy.orm import sessionmaker
 
 
 def _wait_for(client, key: str, path: str, want: str, timeout: float = 20.0) -> dict:
@@ -603,27 +604,30 @@ def test_settlement_preserves_new_reservations(tmp_path, success, charged) -> No
             session.add(run)
             session.commit()
             run_id = run.id
+            account_id = account.id
+            dataset_id = dataset.id
             # Old run's reservation (600 cases) made first...
             assert reserve(
-                session, run_id=run_id, account_id=account.id,
+                session, run_id=run_id, account_id=account_id,
                 case_count=600, period=time.strftime("%Y-%m"), quota=1000,
             )
-            # ...and a NEW reservation (300) made while the worker "read" usage.
-            with sessions() as other:
-                other_run = Run(
-                    account=account, dataset=dataset, model="unused", endpoint="https://example.com"
-                )
-                other.add(other_run)
-                other.commit()
-                assert reserve(
-                    other, run_id=other_run.id, account_id=account.id,
-                    case_count=300, period=time.strftime("%Y-%m"), quota=1000,
-                )
-            # Settlement of the old run (success or refund) must not touch
-            # the new reservation.
-            with sessions() as worker:
-                settle_run(worker, run_id=run_id, charged=charged, success=success)
-                used = used_cases_for(account.id, time.strftime("%Y-%m"), worker)
+        # ...and a NEW reservation (300) made while the worker "read" usage.
+        with sessions() as other:
+            # Re-fetch account/dataset so this session owns them
+            acct2 = other.query(Account).filter_by(id=account_id).one()
+            ds2 = other.query(Dataset).filter_by(id=dataset_id).one()
+            other_run = Run(account=acct2, dataset=ds2, model="unused", endpoint="https://example.com")
+            other.add(other_run)
+            other.commit()
+            assert reserve(
+                other, run_id=other_run.id, account_id=account_id,
+                case_count=300, period=time.strftime("%Y-%m"), quota=1000,
+            )
+        # Settlement of the old run (success or refund) must not touch
+        # the new reservation.
+        with sessions() as worker:
+            settle_run(worker, run_id=run_id, charged=charged, success=success)
+            used = used_cases_for(account_id, time.strftime("%Y-%m"), worker)
             assert used == 300 + charged, used
     finally:
         engine.dispose()
