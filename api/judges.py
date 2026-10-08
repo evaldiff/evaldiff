@@ -51,6 +51,13 @@ async def rubric_llm(
 ) -> Score:
     """Score each rubric criterion 0/1 with a judge LLM, average them.
 
+    Strictness rules (a sloppy judge must not inflate the score):
+    - ``passed`` must be a real JSON boolean — ``"false"`` (a string),
+      ``0``, ``null`` or anything else counts as NOT passed.
+    - Every rubric criterion must have a verdict. Missing, extra, or
+      malformed entries fail their criterion; the denominator is always
+      the number of rubric criteria, never the number of returned verdicts.
+
     Endpoint must speak OpenAI-compatible /chat/completions.
     """
     url = endpoint.rstrip("/")
@@ -81,20 +88,22 @@ async def rubric_llm(
     data = resp.json()
     content = data["choices"][0]["message"]["content"]
     verdicts = _parse_verdicts(content)
-    if not verdicts:
-        return Score(
-            score=0.0,
-            passed=False,
-            raw={"content": content},
-            detail="judge returned no parsable verdicts",
-        )
-    hits = sum(1 for v in verdicts if v.get("passed"))
-    score = hits / len(verdicts)
+    # Strict scoring: match verdicts to rubric criteria by index. Each
+    # criterion needs a well-formed entry with a real boolean ``passed``.
+    # The denominator is always len(rubric) — a judge that drops or
+    # mangles entries can only lower a score, never raise it.
+    n = len(rubric)
+    hits = 0
+    for i, criterion in enumerate(rubric):
+        v = verdicts[i] if i < len(verdicts) else None
+        if isinstance(v, dict) and v.get("passed") is True:
+            hits += 1
+    score = hits / n if n else 0.0
     return Score(
         score=score,
         passed=score >= 0.5,
-        raw={"verdicts": verdicts},
-        detail=f"{hits}/{len(verdicts)} criteria",
+        raw={"verdicts": verdicts, "rubric": rubric},
+        detail=f"{hits}/{n} criteria",
     )
 
 

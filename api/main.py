@@ -13,7 +13,7 @@ from urllib.parse import urlparse
 
 from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
 from pydantic import BaseModel, Field
-from sqlalchemy import case, update
+from sqlalchemy import update
 from sqlalchemy.orm import Session
 
 from . import __version__
@@ -21,6 +21,7 @@ from .auth import create_key, get_current_account
 from .db import Base, get_session, make_engine, state
 from .diff import compute_diff, diff_to_markdown, run_to_markdown
 from .models import Account, Dataset, Run
+from .quota import ledger_metadata, now_period, reserve as reserve_quota, used_cases_for
 from .ratelimit import RateLimiter
 from .secrets import encrypt_api_key, has_secret_key
 from .settings import Settings
@@ -161,6 +162,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         engine = make_engine(settings.database_url)
         state.session_factory = sessionmaker(bind=engine)
         Base.metadata.create_all(engine)
+        ledger_metadata().create_all(engine)  # run_reservations (quota ledger)
         if not has_secret_key():
             logging.getLogger("evaldiff").warning(
                 "EVALDIFF_SECRET_KEY is not set — model API keys stored in "
@@ -302,23 +304,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             validate_endpoint(body.endpoint, settings.allow_local_endpoints)
         except ValueError as exc:
             raise HTTPException(400, str(exc))
-        period = time.strftime("%Y-%m")
-        # Check and reserve against the database value in one statement;
-        # the account loaded during authentication may already be stale.
-        used = case((Account.quota_period == period, Account.used_cases), else_=0)
-        reservation = session.execute(
-            update(Account)
-            .where(Account.id == account.id, used + ds.case_count <= Account.monthly_quota)
-            .values(used_cases=used + ds.case_count, quota_period=period)
-            .execution_options(synchronize_session=False)
-        )
-        if reservation.rowcount != 1:
-            session.rollback()
-            raise HTTPException(
-                status.HTTP_429_TOO_MANY_REQUESTS,
-                "monthly case quota exceeded",
-                headers={"Retry-After": "86400"},
-            )
+        period = now_period()
+        # Quota: reserve atomically against the reservation ledger. The
+        # check lives inside the INSERT's WHERE clause, so concurrent
+        # submissions are serialized by the database (no read-then-write
+        # race) and usage is per-period by construction — settlement can
+        # never touch the wrong month (see api/quota.py).
         run = Run(
             account_id=account.id,
             dataset_id=ds.id,
@@ -335,6 +326,20 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         )
         session.add(run)
         session.flush()
+        if not reserve_quota(
+            session,
+            run_id=run.id,
+            account_id=account.id,
+            case_count=ds.case_count,
+            period=period,
+            quota=account.monthly_quota,
+        ):
+            session.rollback()
+            raise HTTPException(
+                status.HTTP_429_TOO_MANY_REQUESTS,
+                "monthly case quota exceeded",
+                headers={"Retry-After": "86400"},
+            )
         # enqueue_run commits the reservation, run, and job together.
         enqueue_run(session, run.id)
         session.refresh(run)
@@ -418,8 +423,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         account: Account = Depends(get_current_account),
         session: Session = Depends(get_session),
     ) -> UsageOut:
-        period = time.strftime("%Y-%m")
-        used = account.used_cases if account.quota_period == period else 0
+        period = now_period()
+        # Usage = the account's reservations in this period (unsettled at
+        # reserved size, settled at charged). Refunded runs drop out.
+        used = used_cases_for(account.id, period, session)
         return UsageOut(
             period=period,
             quota=account.monthly_quota,

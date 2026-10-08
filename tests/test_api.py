@@ -582,23 +582,19 @@ def test_concurrent_runs_cannot_overbook_quota(tmp_path, case_count, expected_st
 @pytest.mark.parametrize("success, charged", [(True, 200), (False, 0)])
 def test_settlement_preserves_new_reservations(tmp_path, success, charged) -> None:
     """A refund must not overwrite reservations made after the account was read."""
-    from sqlalchemy import update
-    from sqlalchemy.orm import sessionmaker
-
     from api.db import Base, make_engine
     from api.models import Account, Dataset, Run
-    from api.runner import _settle
+    from api.quota import ledger_metadata, reserve, settle_run, used_cases_for
 
     engine = make_engine(f"sqlite:///{tmp_path}/settlement.db")
     Base.metadata.create_all(engine)
+    ledger_metadata().create_all(engine)
     sessions = sessionmaker(bind=engine)
     try:
         with sessions() as session:
             account = Account(
                 email="settlement@example.com",
                 monthly_quota=1000,
-                used_cases=600,
-                quota_period=time.strftime("%Y-%m"),
             )
             dataset = Dataset(account=account, name="d", case_count=600, cases_json="[]")
             run = Run(
@@ -607,23 +603,27 @@ def test_settlement_preserves_new_reservations(tmp_path, success, charged) -> No
             session.add(run)
             session.commit()
             run_id = run.id
-
-        with sessions() as worker:
-            run = worker.get(Run, run_id)
-            stale_account = run.account
-            assert stale_account.used_cases == 600
-            # Another request reserves 300 cases after the worker reads usage.
-            with sessions() as request:
-                request.execute(
-                    update(Account)
-                    .where(Account.id == run.account_id)
-                    .values(used_cases=Account.used_cases + 300)
+            # Old run's reservation (600 cases) made first...
+            assert reserve(
+                session, run_id=run_id, account_id=account.id,
+                case_count=600, period=time.strftime("%Y-%m"), quota=1000,
+            )
+            # ...and a NEW reservation (300) made while the worker "read" usage.
+            with sessions() as other:
+                other_run = Run(
+                    account=account, dataset=dataset, model="unused", endpoint="https://example.com"
                 )
-                request.commit()
-            _settle(worker, run, charged=charged, reserved=600, success=success)
-
-        with sessions() as session:
-            account = session.query(Account).one()
-            assert account.used_cases == 300 + charged
+                other.add(other_run)
+                other.commit()
+                assert reserve(
+                    other, run_id=other_run.id, account_id=account.id,
+                    case_count=300, period=time.strftime("%Y-%m"), quota=1000,
+                )
+            # Settlement of the old run (success or refund) must not touch
+            # the new reservation.
+            with sessions() as worker:
+                settle_run(worker, run_id=run_id, charged=charged, success=success)
+                used = used_cases_for(account.id, time.strftime("%Y-%m"), worker)
+            assert used == 300 + charged, used
     finally:
         engine.dispose()
