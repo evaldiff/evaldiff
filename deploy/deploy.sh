@@ -44,12 +44,12 @@ docker compose ps
 
 # --- smoke test (once the API is up) ---
 for i in $(seq 1 30); do
-  if curl -fsS http://localhost:8000/healthz >/dev/null 2>&1; then
+  if curl -fsS http://localhost:8000/health >/dev/null 2>&1; then
     echo
     echo "API is up:"
-    curl -s http://localhost:8000/healthz
+    curl -s http://localhost:8000/health
     echo
-    echo "Next: verify https://api.evaldiff.io/healthz from outside"
+    echo "Next: verify https://api.evaldiff.io/health from outside"
     exit 0
   fi
   sleep 2

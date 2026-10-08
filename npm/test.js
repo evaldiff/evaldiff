@@ -5,6 +5,9 @@ const { execFileSync } = require("node:child_process");
 const path = require("node:path");
 
 const BIN = path.join(__dirname, "bin", "evaldiff.js");
+const PKG = JSON.parse(
+  require("fs").readFileSync(path.join(__dirname, "package.json"), "utf8"),
+);
 
 function run(args) {
   return execFileSync(process.execPath, [BIN, ...args], {
@@ -13,7 +16,7 @@ function run(args) {
 }
 
 const out = run(["--version"]);
-if (!/^evaldiff 0\.0\.10$/.test(out.trim())) {
+if (out.trim() !== `evaldiff ${PKG.version}`) {
   console.error("FAIL: unexpected version output:", JSON.stringify(out));
   process.exit(1);
 }

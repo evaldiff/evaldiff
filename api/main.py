@@ -456,19 +456,35 @@ def _new_ds_key() -> str:
 
 
 def _client_ip(request: Request) -> str:
-    """Use the peer established by the ASGI server's trusted-proxy policy."""
+    """Use the peer established by the ASGI server's trusted-proxy policy.
+
+    When a reverse proxy fronts the service (Caddy, etc.), set
+    ``FORWARDED_ALLOW_IPS`` to that proxy's address range so Uvicorn's
+    proxy-header middleware resolves ``request.client`` to the real
+    client — which the per-IP signup rate limit then keys on correctly.
+    Outside a trusted peer, ``X-Forwarded-For`` is ignored, so callers
+    cannot spoof their IP to evade the limit.
+    """
     return request.client.host if request.client else ""
 
 
 def run_server() -> None:
-    """Entry point: `evaldiff-server` — run the API with uvicorn."""
+    """Entry point: ``evaldiff-server`` — run the API with uvicorn."""
     import uvicorn
 
-    from .settings import Settings
-
-    settings = Settings()
-    uvicorn.run("api.main:create_app", factory=True, host="0.0.0.0", port=8000, log_level="info")
-    del settings
+    uvicorn.run(
+        "api.main:create_app",
+        factory=True,
+        host="0.0.0.0",
+        port=8000,
+        log_level="info",
+        # Proxy-header handling: honors X-Forwarded-For/-Proto from peers
+        # in FORWARDED_ALLOW_IPS (default: 127.0.0.1,::1). Set
+        # FORWARDED_ALLOW_IPS to the reverse proxy's address range (Caddy
+        # container, etc.) when it fronts this service — see
+        # deploy/docker-compose.yml.
+        proxy_headers=True,
+    )
 
 
 app = None  # set lazily by the CLI/uvicorn entry point

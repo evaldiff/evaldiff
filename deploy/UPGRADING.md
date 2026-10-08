@@ -19,10 +19,15 @@ the run fails and its reservation is refunded. A crash can repeat a request to
 the external model; local result writes and quota settlement are protected,
 but external provider requests cannot be made exactly-once.
 
-Signup limits use the ASGI client's address. Behind a reverse proxy, configure
-Uvicorn's `FORWARDED_ALLOW_IPS` to the trusted proxy addresses. Keep direct API
-access private and have the proxy sanitize forwarded headers. The application
-no longer interprets arbitrary `X-Forwarded-For` headers itself.
+Signup limits use the ASGI client's address, which behind a reverse proxy
+is the real client only if Uvicorn trusts that proxy. `deploy/docker-compose.yml`
+sets `FORWARDED_ALLOW_IPS=172.16.0.0/12` on the `api` service (Caddy is the
+only other peer on the default bridge network), so Caddy's
+`X-Forwarded-For` is honored and per-IP signup limits key on the real
+client. For other topologies set `FORWARDED_ALLOW_IPS` to your proxy's
+address range. Keep direct API access private and have the proxy sanitize
+forwarded headers — Uvicorn only reads `X-Forwarded-For` from peers in the
+trust list, so untrusted callers cannot spoof their IP to evade limits.
 
 ## PostgreSQL regression tests
 

@@ -44,6 +44,14 @@ services:
       EVALDIFF_PUBLIC_BASE_URL: https://api.evaldiff.io
       EVALDIFF_DEFAULT_QUOTA: "1000"
       EVALDIFF_ENABLE_WORKER: "true"
+      # Caddy fronts this service (reverse_proxy api:8000). Uvicorn's
+      # proxy-header middleware trusts X-Forwarded-For only from peers in
+      # this range, so request.client resolves to the REAL client (correct
+      # per-IP signup rate limiting) and not Caddy's shared container IP.
+      # The default bridge network starts at 172.16.0.0/12 — any container
+      # on a Docker bridge network falls inside it, and Caddy is the only
+      # other peer that talks to this service, so the trust is safe.
+      FORWARDED_ALLOW_IPS: "172.16.0.0/12"
     depends_on:
       db:
         condition: service_healthy
