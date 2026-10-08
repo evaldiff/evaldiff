@@ -11,7 +11,7 @@ from datetime import datetime
 from typing import Any
 from urllib.parse import urlparse
 
-from fastapi import Depends, FastAPI, HTTPException, Response, status
+from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
 from pydantic import BaseModel, Field
 from sqlalchemy import case, update
 from sqlalchemy.orm import Session
@@ -21,6 +21,8 @@ from .auth import create_key, get_current_account
 from .db import Base, get_session, make_engine, state
 from .diff import compute_diff, diff_to_markdown, run_to_markdown
 from .models import Account, Dataset, Run
+from .ratelimit import RateLimiter
+from .secrets import encrypt_api_key, has_secret_key
 from .settings import Settings
 from .storage import build_storage
 from .worker import enqueue_run, worker_loop
@@ -110,8 +112,9 @@ def _split_endpoint(endpoint: str) -> tuple[str, int | None]:
 def _is_blocked_host(host: str) -> bool:
     """True for literal IPs in ranges we never call by default (SSRF guard).
 
-    Hostnames are allowed: they must resolve through a normal client DNS and
-    are out of scope for the literal-IP check (see NEEDS-DOING.md, "Later").
+    Hostnames are allowed at *submit* time: the authoritative check happens
+    in ``api.ssrf_guard`` at dial time (the actual connection), which also
+    closes the DNS-rebinding window a pre-flight check has.
     """
     try:
         ip = ipaddress.ip_address(host)
@@ -139,13 +142,31 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.on_event("startup")
     def _startup() -> None:
+        import logging
+
         from sqlalchemy.orm import sessionmaker
 
         state.settings = settings
         state.storage = build_storage(settings)
+        state.limiter = (
+            RateLimiter(
+                rpm=settings.rate_limit_rpm,
+                burst=settings.rate_limit_burst,
+                signup_per_min=settings.signup_rate_per_min,
+                signup_burst=settings.signup_burst,
+            )
+            if settings.rate_limit_rpm > 0 and settings.signup_rate_per_min > 0
+            else None
+        )
         engine = make_engine(settings.database_url)
         state.session_factory = sessionmaker(bind=engine)
         Base.metadata.create_all(engine)
+        if not has_secret_key():
+            logging.getLogger("evaldiff").warning(
+                "EVALDIFF_SECRET_KEY is not set — model API keys stored in "
+                "runs.api_key_ref are PLAINTEXT. Set it (Fernet key) before "
+                "serving real traffic."
+            )
         if settings.enable_worker:
             stop = asyncio.Event()
             app.state.worker_stop = stop
@@ -168,7 +189,21 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     # ---------- auth ----------
     @app.post("/v1/auth/signup", response_model=SignupOut, status_code=status.HTTP_201_CREATED)
-    def signup(body: SignupIn, session: Session = Depends(get_session)) -> SignupOut:
+    def signup(
+        body: SignupIn,
+        request: Request,
+        session: Session = Depends(get_session),
+    ) -> SignupOut:
+        # Signup is unauthenticated — rate-limit by client IP (stricter than
+        # authenticated calls) before anything touches the database.
+        if state.limiter is not None:
+            retry_after = state.limiter.take_signup(_client_ip(request))
+            if retry_after > 0:
+                raise HTTPException(
+                    status.HTTP_429_TOO_MANY_REQUESTS,
+                    "too many signups from this network; try again later",
+                    headers={"Retry-After": str(max(1, int(retry_after)))},
+                )
         email = body.email.strip().lower()
         existing = session.query(Account).filter(Account.email == email).first()
         if existing is not None:
@@ -289,7 +324,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             dataset_id=ds.id,
             model=body.model,
             endpoint=body.endpoint,
-            api_key_ref=body.api_key,
+            # Encrypted at rest when EVALDIFF_SECRET_KEY is configured
+            # (legacy deployments without it store plaintext — loud warning
+            # at startup). The runner decrypts per run.
+            api_key_ref=encrypt_api_key(body.api_key),
             prompt_template=body.prompt_template,
             threshold=body.threshold,
             status="queued",
@@ -403,6 +441,15 @@ def _new_ds_key() -> str:
     import secrets
 
     return f"ds_{int(time.time() * 1000)}_{secrets.token_hex(4)}"
+
+
+def _client_ip(request: Request) -> str:
+    """Best-effort client IP: first X-Forwarded-For hop (behind Caddy/CF),
+    else the direct socket peer. Used only for the signup bucket."""
+    fwd = request.headers.get("x-forwarded-for", "")
+    if fwd:
+        return fwd.split(",")[0].strip()
+    return request.client.host if request.client else ""
 
 
 def run_server() -> None:

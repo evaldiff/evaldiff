@@ -30,3 +30,14 @@ class Settings(BaseSettings):
     # Deployment-administrator controlled only (env var EVALDIFF_ALLOW_LOCAL_ENDPOINTS);
     # API callers have no way to override this per-request.
     allow_local_endpoints: bool = False
+
+    # Per-account rate limit for authenticated API calls (requests/minute,
+    # burst = instantaneous tokens). Anti-abuse backstop, not QoS.
+    # A value of 0 (or below) disables the limiter entirely (tests, local).
+    rate_limit_rpm: float = 30
+    rate_limit_burst: int = 60
+
+    # Stricter: unauthenticated signup is the classic abuse vector.
+    # 0 (or below) disables.
+    signup_rate_per_min: float = 5
+    signup_burst: int = 5

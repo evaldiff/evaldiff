@@ -67,6 +67,8 @@ def _make_ssrf_app(tmp_path, *, allow_local: bool):
             database_url=f"sqlite:///{tmp_path}/ssrf.db",
             enable_worker=False,
             allow_local_endpoints=allow_local,
+            rate_limit_rpm=0,
+            signup_rate_per_min=0,
         )
     )
 
@@ -517,6 +519,8 @@ def test_concurrent_runs_cannot_overbook_quota(tmp_path, case_count, expected_st
             database_url=f"sqlite:///{tmp_path}/concurrent-quota.db",
             default_quota=1000,
             enable_worker=False,
+            rate_limit_rpm=0,
+            signup_rate_per_min=0,
         )
     )
     both_authenticated = Barrier(2, timeout=10)

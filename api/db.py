@@ -25,6 +25,7 @@ class State:
     settings = None
     storage = None
     session_factory: Callable[[], Session] | None = None
+    limiter = None
 
 
 state = State()

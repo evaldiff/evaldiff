@@ -1,4 +1,4 @@
-"""Runner core: render template, call model, score, capture latency/tokens, retry."""
+"""Runner core: render template, call model (through the SSRF guard), score, capture latency/tokens, retry."""
 
 from __future__ import annotations
 
@@ -15,6 +15,8 @@ from sqlalchemy.orm import Session
 from .db import state
 from .judges import score_case
 from .models import Account, Run, RunCase
+from .secrets import decrypt_api_key
+from .ssrf_guard import SSRFGuard
 
 
 async def call_model(
@@ -52,6 +54,61 @@ async def call_model(
     return text, tokens_in, tokens_out
 
 
+async def _execute_cases(run: Run, session: Session, cases: list) -> int:
+    """Run every case through model + judge. Returns the number of OK cases."""
+    ok_cases = 0
+    # All model traffic goes through the in-process SSRF guard: the target
+    # is re-resolved and re-validated at dial time, so a hostname that
+    # rebinds to a private address between the submit-time check and the
+    # connection is still refused. Bound to 127.0.0.1, ephemeral port.
+    allow_local = bool(state.settings.allow_local_endpoints) if state.settings else False
+    guard = SSRFGuard(allow_local=allow_local).start()
+    try:
+        # Decrypt the model key once per run (Fernet at rest, plaintext in
+        # memory only for the duration of this run).
+        api_key = decrypt_api_key(run.api_key_ref)
+        async with httpx.AsyncClient(proxy=guard.proxy_url) as client:
+            for seq, c in enumerate(cases):
+                row = RunCase(run_id=run.id, seq=seq)
+                try:
+                    prompt = _render(run.prompt_template, c)
+                    output, t_in, t_out = await _with_retries(
+                        call_model,
+                        client,
+                        endpoint=run.endpoint,
+                        model=run.model,
+                        api_key=api_key,
+                        prompt=prompt,
+                    )
+                    score = await score_case(
+                        client,
+                        endpoint=run.endpoint,
+                        model=run.model,
+                        api_key=api_key,
+                        output=output,
+                        expected=str(c.get("expected", "")),
+                        rubric=list(c.get("rubric") or []),
+                    )
+                    row.score = round(score.score, 4)
+                    row.passed = bool(score.score >= run.threshold)
+                    row.tokens_in = t_in
+                    row.tokens_out = t_out
+                    if state.storage is not None and run.id:
+                        state.storage.put_json(
+                            f"runs/{run.id}/case_{seq}/output.json",
+                            {"output": output, "score": score.__dict__},
+                        )
+                    ok_cases += 1
+                except Exception as exc:  # noqa: BLE001
+                    # Execution error: case is not charged (see _settle).
+                    row.error = f"{type(exc).__name__}: {exc}"
+                session.add(row)
+                session.flush()
+    finally:
+        guard.stop()
+    return ok_cases
+
+
 async def execute_run(run_id: int) -> None:
     """Drive a single run to done/failed. Called by the worker."""
     session = state.session_factory()
@@ -76,50 +133,7 @@ async def execute_run(run_id: int) -> None:
         # create_run). At settle we replace the reservation with the actual
         # charge: only cases that executed OK are billed. A failed run
         # releases its reservation entirely (refund).
-        ok_cases = 0
-
-        async with httpx.AsyncClient() as client:
-            for seq, case in enumerate(cases):
-                row = RunCase(run_id=run.id, seq=seq)
-                try:
-                    prompt = _render(run.prompt_template, case)
-                    output, t_in, t_out = await _with_retries(
-                        call_model,
-                        client,
-                        endpoint=run.endpoint,
-                        model=run.model,
-                        api_key=run.api_key_ref,
-                        prompt=prompt,
-                    )
-                    judge_cfg = {
-                        "endpoint": run.endpoint,
-                        "model": run.model,
-                        "api_key": run.api_key_ref,
-                    }
-                    score = await score_case(
-                        client,
-                        endpoint=judge_cfg["endpoint"],
-                        model=judge_cfg["model"],
-                        api_key=judge_cfg["api_key"],
-                        output=output,
-                        expected=str(case.get("expected", "")),
-                        rubric=list(case.get("rubric") or []),
-                    )
-                    row.score = round(score.score, 4)
-                    row.passed = bool(score.score >= run.threshold)
-                    row.tokens_in = t_in
-                    row.tokens_out = t_out
-                    if state.storage is not None and run.id:
-                        state.storage.put_json(
-                            f"runs/{run.id}/case_{seq}/output.json",
-                            {"output": output, "score": score.__dict__},
-                        )
-                    ok_cases += 1
-                except Exception as exc:  # noqa: BLE001
-                    # Execution error: case is not charged (see _settle).
-                    row.error = f"{type(exc).__name__}: {exc}"
-                session.add(row)
-                session.flush()
+        ok_cases = await _execute_cases(run, session, cases)
 
         # settle: swap reservation for actual charge (only OK cases billed)
         reserved = run.total_cases

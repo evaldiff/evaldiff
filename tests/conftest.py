@@ -83,6 +83,8 @@ def client(tmp_path, echo_model):
         database_url=f"sqlite:///{tmp_path}/test.db",
         enable_worker=True,
         allow_local_endpoints=True,  # tests use a local echo model (127.0.0.1)
+        rate_limit_rpm=0,  # off by default in tests (dedicated tests enable it)
+        signup_rate_per_min=0,
     )
     app = create_app(settings)
     with TestClient(app) as c:

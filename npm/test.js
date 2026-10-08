@@ -13,7 +13,7 @@ function run(args) {
 }
 
 const out = run(["--version"]);
-if (!/^evaldiff 0\.0\.1$/.test(out.trim())) {
+if (!/^evaldiff 0\.0\.10$/.test(out.trim())) {
   console.error("FAIL: unexpected version output:", JSON.stringify(out));
   process.exit(1);
 }

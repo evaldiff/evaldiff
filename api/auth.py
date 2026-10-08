@@ -6,8 +6,9 @@ import hashlib
 import secrets
 
 from fastapi import Depends, Header, HTTPException, status
+from typing import Optional
 
-from .db import get_session
+from .db import get_session, state
 from .models import Account, ApiKey
 
 
@@ -50,7 +51,7 @@ def _resolve(session, auth: str) -> Account | None:
 
 
 def get_current_account(
-    authorization: str | None = Header(default=None, alias="Authorization"),
+    authorization: Optional[str] = Header(default=None, alias="Authorization"),
     session=Depends(get_session),
 ) -> Account:
     account = _resolve(session, authorization or "")
@@ -59,4 +60,15 @@ def get_current_account(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="invalid or missing API key",
         )
+    # Per-account rate limit (anti-abuse backstop; Retry-After tells the
+    # caller when to try again).
+    limiter = state.limiter
+    if limiter is not None:
+        retry_after = limiter.take_account(account.id)
+        if retry_after > 0:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="rate limit exceeded",
+                headers={"Retry-After": str(max(1, int(retry_after)))},
+            )
     return account
