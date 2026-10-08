@@ -116,26 +116,35 @@ def reserve(
     per-account ``FOR NO KEY UPDATE`` lock serializes reservations
     under Postgres MVCC; SQLite uses an explicit write to serialize them.
     The caller must commit or roll back the transaction.
+
+    The outcome is read from ``RETURNING`` (fetchall), not ``rowcount``:
+    psycopg 3.x reports ``rowcount == -1`` for plain ``INSERT ... SELECT``
+    statements, which would make a successful reservation look rejected.
+    RETURNING yields one row per inserted row and is driver-portable.
     """
     # Serialize reservations before reading aggregate usage. FOR NO KEY
     # UPDATE is compatible with the FK key-share lock taken by Run inserts.
     lock_account(session, account_id)
-    statement = RUN_RESERVATIONS.insert().from_select(
-        ["run_id", "account_id", "period", "reserved", "charged", "settled", "created_at"],
-        select(
-            literal(run_id),
-            literal(account_id),
-            literal(period),
-            literal(case_count),
-            literal(0),
-            false(),
-            literal(time.strftime("%Y-%m-%dT%H:%M:%SZ")),
-        ).where(usage_expr(account_id, period).scalar_subquery() + case_count <= quota),
+    statement = (
+        RUN_RESERVATIONS.insert()
+        .from_select(
+            ["run_id", "account_id", "period", "reserved", "charged", "settled", "created_at"],
+            select(
+                literal(run_id),
+                literal(account_id),
+                literal(period),
+                literal(case_count),
+                literal(0),
+                false(),
+                literal(time.strftime("%Y-%m-%dT%H:%M:%SZ")),
+            ).where(usage_expr(account_id, period).scalar_subquery() + case_count <= quota),
+        )
+        .returning(RUN_RESERVATIONS.c.run_id)
     )
     result = session.execute(statement)
     # The caller owns the transaction: run, reservation, and job must
     # either all commit or all roll back.
-    return result.rowcount == 1
+    return len(result.fetchall()) == 1
 
 
 def lock_account(session: Session, account_id: int) -> None:
@@ -198,17 +207,21 @@ def migrate_legacy_usage(session: Session) -> None:
     from their creation month and successful results. A synthetic, negative
     run ID preserves any legacy counter balance whose runs are unavailable.
     All old application processes must be stopped during this upgrade.
+
+    Idempotency is guarded by a SELECT on the migration-marker row, not by
+    ``ON CONFLICT DO NOTHING`` + ``rowcount``: some Postgres drivers
+    (psycopg 3.x) report ``rowcount == -1`` for INSERT ... SELECT / ON
+    CONFLICT statements, which would misreport an inserted marker row as a
+    conflict and silently skip the backfill. A SELECT guard is portable.
     """
-    if session.bind.dialect.name == "postgresql":
-        from sqlalchemy.dialects.postgresql import insert
-    else:
-        from sqlalchemy.dialects.sqlite import insert
-    marker = session.execute(
-        insert(MIGRATIONS).values(name="legacy_usage_v1").on_conflict_do_nothing()
-    )
-    if marker.rowcount != 1:
-        session.rollback()
+    if (
+        session.execute(
+            select(MIGRATIONS.c.name).where(MIGRATIONS.c.name == "legacy_usage_v1").limit(1)
+        ).first()
+        is not None
+    ):
         return
+    session.execute(MIGRATIONS.insert().values(name="legacy_usage_v1"))
     for account in session.query(Account).all():
         legacy_usage = 0
         missing = (
