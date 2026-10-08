@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import ipaddress
 import json
+import math
 import time
 from datetime import datetime
 from typing import Any
@@ -13,7 +14,6 @@ from urllib.parse import urlparse
 
 from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
 from pydantic import BaseModel, Field
-from sqlalchemy import update
 from sqlalchemy.orm import Session
 
 from . import __version__
@@ -21,7 +21,8 @@ from .auth import create_key, get_current_account
 from .db import Base, get_session, make_engine, state
 from .diff import compute_diff, diff_to_markdown, run_to_markdown
 from .models import Account, Dataset, Run
-from .quota import ledger_metadata, now_period, reserve as reserve_quota, used_cases_for
+from .quota import ledger_metadata, migrate_legacy_usage, now_period, used_cases_for
+from .quota import reserve as reserve_quota
 from .ratelimit import RateLimiter
 from .secrets import encrypt_api_key, has_secret_key
 from .settings import Settings
@@ -163,6 +164,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         state.session_factory = sessionmaker(bind=engine)
         Base.metadata.create_all(engine)
         ledger_metadata().create_all(engine)  # run_reservations (quota ledger)
+        with state.session_factory() as session:
+            migrate_legacy_usage(session)
         if not has_secret_key():
             logging.getLogger("evaldiff").warning(
                 "EVALDIFF_SECRET_KEY is not set — model API keys stored in "
@@ -175,10 +178,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             app.state.worker_task = asyncio.create_task(worker_loop(stop, interval=1.0))
 
     @app.on_event("shutdown")
-    def _shutdown() -> None:
+    async def _shutdown() -> None:
         with contextlib.suppress(Exception):
             app.state.worker_stop.set()
             app.state.worker_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await app.state.worker_task
 
     # ---------- meta ----------
     @app.get("/health")
@@ -204,7 +209,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 raise HTTPException(
                     status.HTTP_429_TOO_MANY_REQUESTS,
                     "too many signups from this network; try again later",
-                    headers={"Retry-After": str(max(1, int(retry_after)))},
+                    headers={"Retry-After": str(max(1, math.ceil(retry_after)))},
                 )
         email = body.email.strip().lower()
         existing = session.query(Account).filter(Account.email == email).first()
@@ -451,11 +456,7 @@ def _new_ds_key() -> str:
 
 
 def _client_ip(request: Request) -> str:
-    """Best-effort client IP: first X-Forwarded-For hop (behind Caddy/CF),
-    else the direct socket peer. Used only for the signup bucket."""
-    fwd = request.headers.get("x-forwarded-for", "")
-    if fwd:
-        return fwd.split(",")[0].strip()
+    """Use the peer established by the ASGI server's trusted-proxy policy."""
     return request.client.host if request.client else ""
 
 

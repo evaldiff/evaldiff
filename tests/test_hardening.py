@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import os
 import socket
-import time
 
 import pytest
 
 # ---------- Fernet at rest (api/secrets.py) ----------
+
 
 def test_fernet_roundtrip(monkeypatch) -> None:
     from api.secrets import decrypt_api_key, encrypt_api_key, generate_secret_key
@@ -67,7 +67,9 @@ def test_api_key_encrypted_at_rest(client, tmp_path) -> None:
         key = client.post("/v1/auth/signup", json={"email": "enc@example.com"}).json()["key"]
         H = {"Authorization": f"Bearer {key}"}
         ds = client.post(
-            "/v1/datasets", headers=H, json={"name": "d", "cases": [{"input": "i", "expected": "e"}]}
+            "/v1/datasets",
+            headers=H,
+            json={"name": "d", "cases": [{"input": "i", "expected": "e"}]},
         ).json()
         r = client.post(
             "/v1/runs",
@@ -80,9 +82,11 @@ def test_api_key_encrypted_at_rest(client, tmp_path) -> None:
             },
         )
         assert r.status_code == 202
-        row = sqlite3.connect(f"{tmp_path}/test.db").execute(
-            "select api_key_ref from runs order by id desc limit 1"
-        ).fetchone()
+        row = (
+            sqlite3.connect(f"{tmp_path}/test.db")
+            .execute("select api_key_ref from runs order by id desc limit 1")
+            .fetchone()
+        )
         assert row[0].startswith("enc:v1:")
         assert "sk-VISIBLE-PLAINTEXT" not in row[0]
     finally:
@@ -90,6 +94,7 @@ def test_api_key_encrypted_at_rest(client, tmp_path) -> None:
 
 
 # ---------- SSRF guard: dial-time validation (DNS rebinding window) ----------
+
 
 def test_guard_blocks_literal_private_at_dial() -> None:
     import httpx
@@ -138,8 +143,7 @@ def test_guard_rebinding_window_closed(monkeypatch) -> None:
         if host == "rebind.example":
             # first (submit-time) lookups see a safe answer; the guard's
             # dial-time lookup returns loopback — simulating a rebinding TTL.
-            if kwargs.get("_guard") or True:
-                return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", 80, 0, 0))]
+            return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", 80))]
         return original(*args, **kwargs)
 
     monkeypatch.setattr(socket, "getaddrinfo", rebinding)
@@ -179,7 +183,10 @@ def test_guard_allow_local_permits_loopback(monkeypatch) -> None:
 
 # ---------- Rate limiting ----------
 
-def _app_with_limits(tmp_path, *, rpm: float, burst: int, signup_rpm: float = 5, signup_burst: int = 3):
+
+def _app_with_limits(
+    tmp_path, *, rpm: float, burst: int, signup_rpm: float = 5, signup_burst: int = 3
+):
     from api.main import create_app
     from api.settings import Settings
 
@@ -223,7 +230,7 @@ def test_signup_rate_limit_is_separate_and_stricter(tmp_path) -> None:
         assert r1.status_code == 201
         assert r2.status_code == 201
         assert r3.status_code == 429
-        assert "retry-after" in {k.lower() for k in r3.headers.keys()}
+        assert "retry-after" in {k.lower() for k in r3.headers}
 
 
 def test_limiter_disabled_by_zero_settings(tmp_path) -> None:

@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import hashlib
+import math
 import secrets
 
 from fastapi import Depends, Header, HTTPException, status
-from typing import Optional
 
 from .db import get_session, state
 from .models import Account, ApiKey
@@ -51,7 +51,7 @@ def _resolve(session, auth: str) -> Account | None:
 
 
 def get_current_account(
-    authorization: Optional[str] = Header(default=None, alias="Authorization"),
+    authorization: str | None = Header(default=None, alias="Authorization"),
     session=Depends(get_session),
 ) -> Account:
     account = _resolve(session, authorization or "")
@@ -69,6 +69,6 @@ def get_current_account(
             raise HTTPException(
                 status_code=status.HTTP_429_TOO_MANY_REQUESTS,
                 detail="rate limit exceeded",
-                headers={"Retry-After": str(max(1, int(retry_after)))},
+                headers={"Retry-After": str(max(1, math.ceil(retry_after)))},
             )
     return account

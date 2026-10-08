@@ -1,8 +1,19 @@
-# evaldiff — NEEDS-DOING (2026-09-30)
+# evaldiff — NEEDS-DOING (updated 2026-10-08)
 
-Written before sleep; picks up exactly where the security hardening stopped.
+## 0. Current status
 
-## 0. STATUS (as of 2026-10-02 13:00 UTC): 0.0.9 SHIPPED — all 6 audit findings fixed + quota-race fix (d9c43af) ✅
+The repository is at 0.0.11, with follow-up reliability and hardening fixes
+implemented locally but **not committed, published, or deployed**. Local
+validation: **50 tests pass**, including 15 new regression tests; lint and
+formatting checks pass. PostgreSQL coverage is configured in CI but has not
+been run locally. Historical release notes below describe earlier verification,
+not the current deployment state.
+
+Next product milestone: **a developer can catch and understand a regression
+in five minutes**. Ship the CLI workflow and useful failure reports together,
+then add named baselines. Keep detailed security findings in the private tracker.
+
+## 1. Release history
 
 ### SHIPPED 0.0.9 (2026-10-02)
 - **Quota reservation race fix** (Peter's commit d9c43af, reviewed + verified):
@@ -72,30 +83,68 @@ api.evaldiff.io/health → **version 0.0.8**.
 
 ## 3. TO DO next (in priority order)
 
-### A. Small code nits
-1. ~~`/health` version stale~~ FIXED in 0.0.7 (importlib.metadata; live reports 0.0.7) ✅
-2. Tag `v1` on evaldiff/action (pushed 7c34df5, tag not yet created).
+### A. Finish the current reliability release
 
-### B. Hardening backlog (tracked privately, fix before scale)
-- Endpoint validation hardening (medium effort)
-- API-key encryption at rest
-- Per-key rate limiting
-- `/v1/runs` pagination
-- FastAPI `on_event` → lifespan (cosmetic)
-- ~~**npm package** `@evaldiff/evaldiff` was 0.0.1~~ **0.0.9 live** (2026-10-08, stage publish + web approve; `npm install @evaldiff/evaldiff@0.0.9` verified)
+- [ ] Review and commit the local quota, recovery, HTTPS, and rate-limit fixes.
+- [ ] Run CI, including the PostgreSQL quota/recovery tests, before publishing.
+- [ ] Publish the release and update deployment pins to the tested version.
+- [ ] Follow [the upgrade instructions](deploy/UPGRADING.md): stop old workers
+  before starting the updated application and its one-time usage migration.
+- [ ] Verify the deployed version and an end-to-end evaluation after rollout.
 
-### C. Product
-1. ~~**Landing page** on evaldiff.io root~~ **LIVE 2026-10-07** (self-contained index.html served by Caddy on the apex; Let's Encrypt TLS, HSTS).
-2. ~~**Forkable demo repo** `evaldiff/example-repo`~~ **LIVE + red/green verified** (2026-10-07: `GATE PASS 100%` and an intentional `GATE FAIL 33%`, then re-pass; runs against a self-hosted model via the public open-webui endpoint).
-3. ~~**Tag `v1` on evaldiff/action**~~ **v1 cut; v2 cut 2026-10-07** (fix: legacy `::set-output` command was disabled by runners and failed every step after reporting — GITHUB_OUTPUT heredoc handling only now).
-4. Usage guide (final, auto-capturing one-liner version) → into the action README so it's discoverable on the repo page.
+### B. Next milestone: CLI workflow + actionable failure reports
+
+Ship these two features together:
+
+1. **Finish the CLI workflow.** Implement `evaldiff run` and `evaldiff diff`,
+   with authentication, progress, timeouts, and reliable exit codes for CI.
+   Align the README quickstart with the implemented commands.
+2. **Show why a case failed.** Include input, expected answer, actual output,
+   and judge explanation in JSON and Markdown reports. Make the evidence
+   available after the run finishes so a failed gate is actionable.
+
+Acceptance: extend the existing forkable demo with one complete CLI example.
+A developer should be able to run a passing baseline, deliberately change a
+prompt to introduce a regression, get a failing gate, and inspect enough
+evidence to diagnose it within five minutes. Put the usage guide in the action
+README so the workflow is discoverable.
+
+### C. Following features, in order
+
+1. **Named baselines.** Compare a candidate against the last approved run,
+   for example `evaldiff diff --baseline main` (proposed syntax). Record
+   dataset, prompt, model, and commit versions so comparisons are reproducible.
+2. **Model variability.** Support repeated evaluations and report score spread
+   to help users distinguish a regression from a flaky result before blocking
+   a release.
+3. **Deterministic checks.** Add JSON-schema validation, required fields,
+   regex matching, and numeric tolerances for structured-output evaluations.
+
+### D. Later / maintenance
+
+- Validate the core workflow with a few real users before building a large
+  dashboard. Learn whether the gate catches problems and whether users trust
+  its results enough to block releases.
+- `/v1/runs` pagination.
+- FastAPI `on_event` → lifespan.
+- Continue hardening from the private tracker. Endpoint filtering, model-key
+  encryption, and account/signup rate limiting are implemented; release
+  verification belongs in section A rather than a new-feature backlog.
+
+### E. Previously completed product work (recorded history)
+
+- **Landing page:** evaldiff.io root live 2026-10-07.
+- **Forkable demo:** `evaldiff/example-repo` live with red/green gate verification
+  recorded 2026-10-07; extend it for the CLI milestone above.
+- **GitHub Action:** `v1` cut; `v2` cut 2026-10-07 with `GITHUB_OUTPUT` handling.
+- **npm package:** `@evaldiff/evaldiff` 0.0.9 publication verified 2026-10-08.
 
 ## 4. Environment quick-reference
 - API: https://api.evaldiff.io (159.69.47.127, Hetzner, deploy@ key-based)
 - Auth: header `Authorization: Bearer *** (eval_...)
 - Box: ~/evaldiff-deploy/docker-compose.yml, SeaweedFS S3 on :8333 (internal)
-- Tests: `cd ~/evaldiff && .venv/bin/python -m pytest -q` (12 tests)
-- Lint: `uvx ruff check api/ tests/`
+- Tests: `.venv/bin/python -m pytest -q` (50 passing locally as of this update)
+- Lint / format: `.venv/bin/ruff check .` and `.venv/bin/ruff format --check .`
 - Action: ~/evaldiff-action → repo evaldiff/action (token in .git/config)
 - Usage guide (final): /home/peter/evaldiff-guide-auto.md (send as base64!)
 
@@ -104,5 +153,5 @@ Hardened and live-verified: signup takeover blocked (409), SSRF literal-IP
 guard with server-side policy (callers cannot override), failed-run state
 persistence, quota reservation at enqueue (race-safe, 4×600 concurrent
 verified), failed-case billing, hashed API keys, SQLi-safe ORM layer,
-cross-tenant isolation. Remaining hardening items are tracked in the
-private backlog above.
+cross-tenant isolation. Remaining hardening details are tracked privately; the current release
+checklist and product priorities are in section 3.

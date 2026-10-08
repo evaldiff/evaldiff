@@ -1,33 +1,23 @@
-"""Worker: poll the jobs table and execute runs. v0: in-process asyncio loop.
-
-Crash recovery (P2 fix)
-------------------------
-Only *pending* jobs were claimed before, so a process that died (or was
-shut down) mid-run left its job stuck at "running" and its run at
-"running" forever, with the quota reservation never refunded.
-``recover_abandoned_jobs`` runs at startup and on each poll: it finds
-running jobs whose run never reached a terminal state, refunds the
-reservation (idempotent ledger settle), clears partial case rows, and
-requeues the job. Reclaim is safe to repeat — settlement is guarded and
-case-row cleanup is a no-op when there is nothing to delete.
-"""
+"""Claim jobs atomically; recover only expired leases and fence stale writers."""
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
-import os
-import socket
+from datetime import datetime, timedelta, timezone
+from uuid import uuid4
+
+from sqlalchemy import update
 
 from .db import state
+from .leases import HEARTBEAT_SECONDS, LEASE_SECONDS, JobLease, LeaseLost, fence
 from .models import Job, Run
-from .quota import cleanup_for_reclaim
+from .quota import cleanup_for_reclaim, settle_run
 from .runner import execute_run
 
-_WORKER_ID = f"{socket.gethostname()}:{os.getpid()}"
-_MAX_JOB_ATTEMPTS = 2  # a run that fails twice is a bad run, not a flaky one
-
+_MAX_JOB_ATTEMPTS = 2
 log = logging.getLogger("evaldiff.worker")
 
 
@@ -37,122 +27,171 @@ def enqueue_run(session, run_id: int) -> None:
 
 
 def recover_abandoned_jobs(session) -> int:
-    """Refund + requeue runs whose previous job holder died. Returns count."""
-    recovered = 0
-    stuck = (
+    """Reclaim expired attempts atomically, retaining quota for a retry."""
+    if session.bind.dialect.name == "postgresql":
+        from sqlalchemy.dialects.postgresql import insert
+    else:
+        from sqlalchemy.dialects.sqlite import insert
+    # Pre-lease jobs can be recovered on upgrade. Old processes must be
+    # stopped before starting this version (see the upgrade instructions).
+    legacy = (
         session.query(Job)
-        .filter(Job.status == "running", Job.kind == "run")
-        .order_by(Job.id)
+        .outerjoin(JobLease, Job.id == JobLease.job_id)
+        .filter(
+            Job.status == "running",
+            JobLease.job_id.is_(None),
+        )
         .all()
     )
-    for job in stuck:
-        payload = json.loads(job.payload_json or "{}")
-        run_id = payload.get("run_id")
-        if run_id is None:
-            job.status = "done"  # no run attached: nothing to recover
-            session.commit()
+    for job in legacy:
+        session.execute(
+            insert(JobLease)
+            .values(
+                job_id=job.id,
+                token="legacy",
+                expires_at=datetime.now(timezone.utc).replace(tzinfo=None),
+            )
+            .on_conflict_do_nothing()
+        )
+    session.commit()
+    ids = (
+        session.query(Job.id)
+        .join(JobLease, Job.id == JobLease.job_id)
+        .filter(
+            Job.status == "running",
+            Job.kind == "run",
+            JobLease.expires_at <= datetime.now(timezone.utc).replace(tzinfo=None),
+        )
+        .all()
+    )
+    session.rollback()
+    recovered = 0
+    for (job_id,) in ids:
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        won = session.execute(
+            update(JobLease)
+            .where(
+                JobLease.job_id == job_id,
+                JobLease.expires_at <= now,
+            )
+            .values(token=uuid4().hex, expires_at=now + timedelta(seconds=LEASE_SECONDS))
+            .execution_options(synchronize_session=False)
+        )
+        if won.rowcount != 1:
+            session.rollback()
             continue
-        run = session.get(Run, run_id)
-        if run is not None and run.status in ("done", "failed"):
-            # The previous attempt actually finished; it just didn't get to
-            # mark the job done. Close it out.
+        job = session.get(Job, job_id, populate_existing=True)
+        if job.status != "running":
+            session.rollback()
+            continue
+        run_id = json.loads(job.payload_json or "{}").get("run_id")
+        run = session.get(Run, run_id) if run_id else None
+        if run is None or run.status in ("done", "failed"):
             job.status = "done"
-            session.commit()
-            continue
-        if run is None:
-            job.status = "done"  # run was deleted: nothing to recover
-            session.commit()
-            continue
-        if job.attempts >= _MAX_JOB_ATTEMPTS:
-            # Already ran (and died) twice: settle the reservation as a
-            # failure and park the job — requeueing forever is not a fix.
+        else:
             cleanup_for_reclaim(session, run)
-            run.status = "failed"
-            run.error = (run.error or "") + " [abandoned: max attempts exceeded]"
-            job.status = "failed"
-            session.commit()
-            continue
-        # Refund (idempotent) + drop partial cases, then requeue.
-        cleanup_for_reclaim(session, run)
-        run.status = "queued"
-        job.status = "pending"
-        job.claimed_by = None
+            if job.attempts >= _MAX_JOB_ATTEMPTS:
+                settle_run(session, run_id=run.id, charged=0, success=False)
+                run.status = "failed"
+                run.error = "abandoned: max attempts exceeded"
+                run.finished_at = now
+                job.status = "failed"
+            else:
+                run.status = "queued"
+                job.status = "pending"
+                recovered += 1
+            job.claimed_by = None
         session.commit()
-        recovered += 1
-        log.info("recovered abandoned run %s (job %s)", run_id, job.id)
     return recovered
 
 
 async def poll_once(session) -> int:
-    """Claim one pending job (atomic on Postgres; SQLite is single-connection safe in v0)."""
     job = session.query(Job).filter(Job.status == "pending").order_by(Job.id).first()
     if job is None:
         return 0
-    if session.bind.dialect.name == "postgresql":
-        # idempotent claim (SQLite path is single-process; Postgres: rely on row lock)
-        updated = (
-            session.query(Job)
-            .filter(Job.id == job.id, Job.status == "pending")
-            .update(
-                {
-                    Job.status: "running",
-                    Job.claimed_by: _WORKER_ID,
-                    Job.attempts: Job.attempts + 1,
-                },
-                synchronize_session=False,
-            )
+    job_id = job.id
+    token = uuid4().hex
+    updated = session.execute(
+        update(Job)
+        .where(
+            Job.id == job_id,
+            Job.status == "pending",
         )
-        session.commit()
-        if updated == 0:
-            return 0
-    else:
-        job.status = "running"
-        job.claimed_by = _WORKER_ID
-        job.attempts += 1
-        session.commit()
-    return job.id
+        .values(status="running", claimed_by=token, attempts=Job.attempts + 1)
+        .execution_options(synchronize_session=False)
+    )
+    if updated.rowcount != 1:
+        session.rollback()
+        return 0
+    session.merge(
+        JobLease(
+            job_id=job_id,
+            token=token,
+            expires_at=datetime.now(timezone.utc).replace(tzinfo=None)
+            + timedelta(seconds=LEASE_SECONDS),
+        )
+    )
+    session.commit()
+    return job_id
+
+
+async def _heartbeat(job_id: int, token: str, attempt: asyncio.Task) -> None:
+    try:
+        while True:
+            await asyncio.sleep(HEARTBEAT_SECONDS)
+            with state.session_factory() as session:
+                fence(session, job_id, token)
+                session.commit()
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        log.exception("could not renew job %s; stopping attempt", job_id)
+        attempt.cancel()
 
 
 async def worker_loop(stop: asyncio.Event, interval: float = 2.0) -> None:
     while not stop.is_set():
         try:
-            session = state.session_factory()
-            try:
+            with state.session_factory() as session:
                 recover_abandoned_jobs(session)
                 job_id = await poll_once(session)
-            finally:
-                session.close()
+                job = session.get(Job, job_id) if job_id else None
+                token = job.claimed_by if job else None
+                payload = json.loads(job.payload_json) if job else {}
             if job_id:
-                payload = _load_payload(job_id)
-                run_id = payload.get("run_id")
-                if run_id:
-                    await execute_run(run_id)
-                _finish_job(job_id)
-        except Exception as exc:
-            # A stuck worker must not kill the process — log and continue;
-            # the next tick (or the next process start) recovers the job.
-            log.error("job loop error", exc_info=exc)
+                attempt = asyncio.create_task(
+                    execute_run(
+                        payload["run_id"],
+                        job_id=job_id,
+                        lease_token=token,
+                    )
+                )
+                heartbeat = asyncio.create_task(_heartbeat(job_id, token, attempt))
+                try:
+                    await attempt
+                    _finish_job(job_id, token)
+                except asyncio.CancelledError:
+                    if not heartbeat.done():
+                        raise  # shutdown cancellation, not a failed heartbeat
+                finally:
+                    heartbeat.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await heartbeat
+        except Exception:
+            log.exception("job loop error")
         try:
             await asyncio.wait_for(stop.wait(), timeout=interval)
         except asyncio.TimeoutError:
             pass
 
 
-def _load_payload(job_id: int) -> dict:
-    session = state.session_factory()
-    try:
-        job = session.get(Job, job_id)
-        return json.loads(job.payload_json) if job else {}
-    finally:
-        session.close()
-
-
-def _finish_job(job_id: int) -> None:
-    session = state.session_factory()
-    try:
-        job = session.get(Job, job_id)
-        if job:
-            job.status = "done"
-            session.commit()
-    finally:
-        session.close()
+def _finish_job(job_id: int, token: str) -> None:
+    with state.session_factory() as session:
+        try:
+            fence(session, job_id, token)
+        except LeaseLost:
+            return
+        session.execute(
+            update(Job).where(Job.id == job_id, Job.claimed_by == token).values(status="done")
+        )
+        session.commit()

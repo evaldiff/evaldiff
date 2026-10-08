@@ -54,7 +54,7 @@ def decrypt_api_key(value: str) -> str:
             "in this process — the key cannot be recovered"
         )
     try:
-        return f.decrypt(value[len(_PREFIX):].encode("ascii")).decode("utf-8")
+        return f.decrypt(value[len(_PREFIX) :].encode("ascii")).decode("utf-8")
     except InvalidToken as exc:
         raise RuntimeError(
             "stored key could not be decrypted — EVALDIFF_SECRET_KEY does not "

@@ -15,11 +15,9 @@ class Base(DeclarativeBase):
 def make_engine(url: str):
     kwargs: dict = {}
     if url.startswith("sqlite"):
-        # SERIALIZABLE => BEGIN IMMEDIATE: each transaction takes
-        # SQLite's write lock at its first statement, so concurrent
-        # writes (e.g. two parallel quota reservations) are fully
-        # serialized — the conditional INSERT in api/quota.reserve()
-        # then reads committed ledger state instead of a stale snapshot.
+        # SQLite serializes writes; quota reservations explicitly acquire
+        # the write lock before checking usage. SERIALIZABLE alone does
+        # not issue BEGIN IMMEDIATE in the sqlite3 driver.
         kwargs["isolation_level"] = "SERIALIZABLE"
         # Generous lock-wait so a blocked writer waits for the concurrent
         # writer instead of failing after 5s.

@@ -5,10 +5,10 @@ from __future__ import annotations
 import time
 
 import pytest
+from sqlalchemy.orm import sessionmaker
 from starlette.testclient import TestClient
 
 from api.db import state
-from sqlalchemy.orm import sessionmaker
 
 
 def _wait_for(client, key: str, path: str, want: str, timeout: float = 20.0) -> dict:
@@ -608,21 +608,33 @@ def test_settlement_preserves_new_reservations(tmp_path, success, charged) -> No
             dataset_id = dataset.id
             # Old run's reservation (600 cases) made first...
             assert reserve(
-                session, run_id=run_id, account_id=account_id,
-                case_count=600, period=time.strftime("%Y-%m"), quota=1000,
+                session,
+                run_id=run_id,
+                account_id=account_id,
+                case_count=600,
+                period=time.strftime("%Y-%m"),
+                quota=1000,
             )
+            session.commit()
         # ...and a NEW reservation (300) made while the worker "read" usage.
         with sessions() as other:
             # Re-fetch account/dataset so this session owns them
             acct2 = other.query(Account).filter_by(id=account_id).one()
             ds2 = other.query(Dataset).filter_by(id=dataset_id).one()
-            other_run = Run(account=acct2, dataset=ds2, model="unused", endpoint="https://example.com")
+            other_run = Run(
+                account=acct2, dataset=ds2, model="unused", endpoint="https://example.com"
+            )
             other.add(other_run)
             other.commit()
             assert reserve(
-                other, run_id=other_run.id, account_id=account_id,
-                case_count=300, period=time.strftime("%Y-%m"), quota=1000,
+                other,
+                run_id=other_run.id,
+                account_id=account_id,
+                case_count=300,
+                period=time.strftime("%Y-%m"),
+                quota=1000,
             )
+            other.commit()
         # Settlement of the old run (success or refund) must not touch
         # the new reservation.
         with sessions() as worker:

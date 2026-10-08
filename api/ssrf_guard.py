@@ -24,8 +24,8 @@ services, even when a hostname rebinds between lookups.
 
 from __future__ import annotations
 
-import asyncio
 import ipaddress
+import select
 import socket
 import threading
 from typing import Any
@@ -114,20 +114,16 @@ def _dial(host: str, port: int, *, allow_local: bool) -> socket.socket:
     raise GuardError(f"{host}:{port}: no safe route (last: {last_err})")
 
 
-def _forward(src: socket.socket, dst: socket.socket, stop: threading.Event) -> None:
-    try:
-        while not stop.is_set():
-            data = src.recv(65536)
+def _tunnel(client: socket.socket, upstream: socket.socket, stop: threading.Event) -> None:
+    """Relay TLS bytes without terminating TLS or changing certificate checks."""
+    while not stop.is_set():
+        readable, _, _ = select.select([client, upstream], [], [], 0.5)
+        for source in readable:
+            data = source.recv(65536)
             if not data:
-                break
-            dst.sendall(data)
-    except (OSError, ConnectionError):
-        pass
-    finally:
-        try:
-            dst.shutdown(socket.SHUT_WR)
-        except OSError:
-            pass
+                return
+            destination = upstream if source is client else client
+            destination.sendall(data)
 
 
 def _read_headers(sock: socket.socket) -> tuple[list[bytes], dict[str, str]]:
@@ -229,7 +225,8 @@ def _read_response(sock: socket.socket, cap: int = 64 * 1024 * 1024) -> bytes:
     return bytes(out)
 
 
-def _handle(client: socket.socket, *, allow_local: bool) -> None:
+def _handle(client: socket.socket, *, allow_local: bool, stop: threading.Event) -> None:
+    client.settimeout(120)
     try:
         raw_lines, headers = _read_headers(client)
         if not raw_lines:
@@ -241,24 +238,19 @@ def _handle(client: socket.socket, *, allow_local: bool) -> None:
             client.close()
             return
         method, target, version = parts[0], parts[1], (parts[2] if len(parts) > 2 else "HTTP/1.1")
-        if not target.startswith(("http://", "https://")):
-            client.sendall(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n")
-            client.close()
-            return
-        from urllib.parse import urlparse
+        from urllib.parse import urlsplit
 
-        p = urlparse(target)
+        is_connect = method == "CONNECT"
+        p = urlsplit("//" + target if is_connect else target)
+        if (not is_connect and p.scheme != "http") or p.username or p.password:
+            raise ValueError("invalid proxy target")
         host = p.hostname or ""
-        if not host:
-            client.sendall(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n")
-            client.close()
-            return
-        port = p.port or (443 if p.scheme == "https" else 80)
+        port = p.port or (443 if is_connect else 80)
+        if not host or (is_connect and (p.path or p.query or p.fragment)):
+            raise ValueError("invalid proxy authority")
         path = p.path or "/"
         if p.query:
             path = f"{path}?{p.query}"
-        if p.fragment:
-            path = f"{path}#{p.fragment}"
 
         body = b""
         if "content-length" in headers:
@@ -274,27 +266,34 @@ def _handle(client: socket.socket, *, allow_local: bool) -> None:
     except GuardError as exc:
         body = str(exc).encode("utf-8", "replace")
         client.sendall(
-            (
-                f"HTTP/1.1 403 Forbidden\r\n"
-                f"Content-Length: {len(body)}\r\n"
-                f"X-Evaldiff-Guard: blocked\r\n"
-                f"\r\n".encode()
-                + body
-            )
+            f"HTTP/1.1 403 Forbidden\r\n"
+            f"Content-Length: {len(body)}\r\n"
+            f"X-Evaldiff-Guard: blocked\r\n"
+            f"\r\n".encode()
+            + body
         )
         client.close()
         return
-    except OSError as exc:
+    except ValueError:
+        client.sendall(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n")
+        client.close()
+        return
+    except OSError:
         client.sendall(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
         client.close()
         return
 
     try:
+        upstream.settimeout(120)
+        if is_connect:
+            client.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            _tunnel(client, upstream, stop)
+            return
         # Rebuild the request in origin form for the upstream server.
         # (raw_lines ends with the blank separator line — exclude it.)
         hdr_lines = [
             f"{method} {path} {version}",
-            f"Host: {host}",
+            f"Host: {p.netloc}",
             "Connection: close",
         ]
         for line in raw_lines[1:-1]:
@@ -310,10 +309,8 @@ def _handle(client: socket.socket, *, allow_local: bool) -> None:
     except OSError as exc:
         try:
             client.sendall(
-                (
-                    f"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n"
-                    f"X-Evaldiff-Guard: {type(exc).__name__}\r\n\r\n".encode()
-                )
+                f"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n"
+                f"X-Evaldiff-Guard: {type(exc).__name__}\r\n\r\n".encode()
             )
         except OSError:
             pass
@@ -340,16 +337,18 @@ class SSRFGuard:
     """
 
     def __init__(self, *, allow_local: bool = False, host: str = "127.0.0.1") -> None:
+        self._stop = threading.Event()
         self.allow_local = allow_local
         self.host = host
         self._server: Any = None
         self._thread: threading.Thread | None = None
         self.port: int | None = None
 
-    def start(self) -> "SSRFGuard":
+    def start(self) -> SSRFGuard:
         import socketserver
 
-        handler_args = {"allow_local": self.allow_local}
+        self._stop.clear()
+        handler_args = {"allow_local": self.allow_local, "stop": self._stop}
 
         class _Handler(socketserver.StreamRequestHandler):
             def handle(self) -> None:  # type: ignore[override]
@@ -373,6 +372,7 @@ class SSRFGuard:
         return f"http://{self.host}:{self.port}"
 
     def stop(self) -> None:
+        self._stop.set()
         if self._server is not None:
             self._server.shutdown()
             self._server.server_close()

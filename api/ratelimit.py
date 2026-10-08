@@ -59,7 +59,7 @@ class RateLimiter:
     """Two registries: per-account (authenticated) and per-IP (signup)."""
 
     def __init__(self, *, rpm: float, burst: int, signup_per_min: float, signup_burst: int) -> None:
-        self.accounts = _BucketRegistry(rpm, burst)
+        self.accounts = _BucketRegistry(rpm / 60.0, burst)
         self.signup = _BucketRegistry(signup_per_min / 60.0, signup_burst)
 
     def take_account(self, account_id: int) -> float:

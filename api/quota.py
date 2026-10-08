@@ -36,14 +36,16 @@ from sqlalchemy import (
     String,
     Table,
     case,
+    false,
     func,
+    literal,
     select,
     text,
     update,
 )
 from sqlalchemy.orm import Session
 
-from .models import Run, RunCase
+from .models import Account, Run, RunCase
 
 # Declarative table, created via create_all alongside the ORM models.
 # A dedicated MetaData keeps the ledger independent of the model set.
@@ -92,9 +94,7 @@ def usage_expr(account_id: int, period: str):
 
 def used_cases_for(account_id: int, period: str, session: Session) -> int:
     """Current owed cases for the account in ``period`` (for reporting)."""
-    value = session.execute(
-        select(usage_expr(account_id, period).scalar_subquery())
-    ).scalar()
+    value = session.execute(select(usage_expr(account_id, period).scalar_subquery())).scalar()
     return int(value or 0)
 
 
@@ -113,46 +113,44 @@ def reserve(
     that case nothing was written. The quota check lives inside a
     conditional ``INSERT ... SELECT`` (scalar aggregate over the ledger
     in the WHERE clause), so there is no read-then-write race. A
-    per-account ``FOR UPDATE`` lock serializes concurrent reservations
-    under Postgres MVCC (SQLite ignores FOR UPDATE; its write lock
-    already serializes).
+    per-account ``FOR NO KEY UPDATE`` lock serializes reservations
+    under Postgres MVCC; SQLite uses an explicit write to serialize them.
+    The caller must commit or roll back the transaction.
     """
-    sql = (
-        "INSERT INTO run_reservations "
-        "(run_id, account_id, period, reserved, charged, settled, created_at) "
-        "SELECT :run_id, :account_id, :period, :case_count, 0, 0, :created_at "
-        "WHERE (SELECT COALESCE(SUM(CASE WHEN settled THEN charged ELSE reserved END), 0) "
-        "FROM run_reservations WHERE account_id = :account_id AND period = :period) "
-        "+ :case_count <= :quota"
+    # Serialize reservations before reading aggregate usage. FOR NO KEY
+    # UPDATE is compatible with the FK key-share lock taken by Run inserts.
+    lock_account(session, account_id)
+    statement = RUN_RESERVATIONS.insert().from_select(
+        ["run_id", "account_id", "period", "reserved", "charged", "settled", "created_at"],
+        select(
+            literal(run_id),
+            literal(account_id),
+            literal(period),
+            literal(case_count),
+            literal(0),
+            false(),
+            literal(time.strftime("%Y-%m-%dT%H:%M:%SZ")),
+        ).where(usage_expr(account_id, period).scalar_subquery() + case_count <= quota),
     )
-    params = {
-        "run_id": run_id,
-        "account_id": account_id,
-        "period": period,
-        "case_count": case_count,
-        "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "quota": quota,
-    }
+    result = session.execute(statement)
+    # The caller owns the transaction: run, reservation, and job must
+    # either all commit or all roll back.
+    return result.rowcount == 1
+
+
+def lock_account(session: Session, account_id: int) -> None:
     if session.bind.dialect.name == "postgresql":
-        # Per-account row lock serializes concurrent reservations under
-        # MVCC; the conditional INSERT's WHERE clause then sees committed
-        # state at commit time.
         session.execute(
-            text("SELECT 1 FROM accounts WHERE id = :aid FOR UPDATE"), {"aid": account_id}
+            text("SELECT id FROM accounts WHERE id = :id FOR NO KEY UPDATE"),
+            {"id": account_id},
         )
-    # SQLite: the caller's transaction is SERIALIZABLE (BEGIN IMMEDIATE,
-    # see api/db.make_engine) — it holds the write lock from its first
-    # statement, so a concurrent reservation commits (or is rejected)
-    # BEFORE ours reads the ledger. The WHERE clause then sees committed
-    # state and exactly one of the two passes. No read-then-write race.
-    result = session.execute(text(sql), params)
-    if (result.rowcount or 0) == 1:
-        session.commit()
-        return True
-    # Rejected: roll back so the caller's pending rows (e.g. the flushed
-    # Run) never get committed — the endpoint returns 429 and discards.
-    session.rollback()
-    return False
+    else:
+        session.execute(
+            update(Account)
+            .where(Account.id == account_id)
+            .values(id=Account.id)
+            .execution_options(synchronize_session=False)
+        )
 
 
 def settle_run(session: Session, *, run_id: int, charged: int, success: bool) -> bool:
@@ -163,7 +161,8 @@ def settle_run(session: Session, *, run_id: int, charged: int, success: bool) ->
 
     Returns True if THIS call performed the settlement, False if it had
     already been settled (crash recovery, duplicate call). The guarded
-    UPDATE makes settlement idempotent by construction.
+    UPDATE makes settlement idempotent. The caller commits it together
+    with the terminal run/job status.
     """
     result = session.execute(
         update(RUN_RESERVATIONS)
@@ -172,17 +171,87 @@ def settle_run(session: Session, *, run_id: int, charged: int, success: bool) ->
         .values(settled=True, charged=charged if success else 0)
         .execution_options(synchronize_session=False)
     )
-    session.commit()
     return (result.rowcount or 0) == 1
 
 
 def cleanup_for_reclaim(session: Session, run: Run) -> None:
-    """Idempotent cleanup for a run whose job died mid-flight: refund the
-    reservation (if not already settled) and drop partial case rows so a
-    requeued attempt starts clean. The job row is requeued by the caller."""
-    settle_run(session, run_id=run.id, charged=0, success=False)
+    """Clear partial results while retaining the retry's quota reservation."""
     session.query(RunCase).filter(RunCase.run_id == run.id).delete(synchronize_session=False)
+    run.started_at = None
+    run.finished_at = None
+    run.passed_cases = 0
+    run.avg_score = None
+    run.error = None
+
+
+MIGRATIONS = Table(
+    "quota_migrations",
+    _ledger_meta,
+    Column("name", String(80), primary_key=True),
+)
+
+
+def migrate_legacy_usage(session: Session) -> None:
+    """Backfill once, atomically, before accepting requests or starting workers.
+
+    Existing ledger entries are authoritative. Missing runs are reconstructed
+    from their creation month and successful results. A synthetic, negative
+    run ID preserves any legacy counter balance whose runs are unavailable.
+    All old application processes must be stopped during this upgrade.
+    """
+    if session.bind.dialect.name == "postgresql":
+        from sqlalchemy.dialects.postgresql import insert
+    else:
+        from sqlalchemy.dialects.sqlite import insert
+    marker = session.execute(
+        insert(MIGRATIONS).values(name="legacy_usage_v1").on_conflict_do_nothing()
+    )
+    if marker.rowcount != 1:
+        session.rollback()
+        return
+    for account in session.query(Account).all():
+        legacy_usage = 0
+        missing = (
+            session.query(Run)
+            .filter(
+                Run.account_id == account.id,
+                ~Run.id.in_(select(RUN_RESERVATIONS.c.run_id)),
+            )
+            .all()
+        )
+        for run in missing:
+            period = run.created_at.strftime("%Y-%m")
+            terminal = run.status in ("done", "failed")
+            charged = (
+                sum(c.error is None and c.score is not None for c in run.cases)
+                if run.status == "done"
+                else 0
+            )
+            reserved = run.total_cases or run.dataset.case_count
+            session.execute(
+                RUN_RESERVATIONS.insert().values(
+                    run_id=run.id,
+                    account_id=account.id,
+                    period=period,
+                    reserved=reserved,
+                    charged=charged,
+                    settled=terminal,
+                )
+            )
+            if period == account.quota_period:
+                legacy_usage += charged if terminal else reserved
+        # Pre-ledger counters stop changing once ledger accounting is active.
+        # Subtract only reconstructed legacy runs, not new ledger-era usage.
+        residual = max(0, account.used_cases - legacy_usage)
+        if residual and account.quota_period:
+            session.execute(
+                RUN_RESERVATIONS.insert().values(
+                    run_id=-account.id,
+                    account_id=account.id,
+                    period=account.quota_period,
+                    reserved=0,
+                    charged=residual,
+                    settled=True,
+                )
+            )
     session.commit()
-
-
-

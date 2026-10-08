@@ -19,14 +19,15 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
-import time
 from datetime import datetime, timezone
+from uuid import uuid4
 
 import httpx
 from sqlalchemy.orm import Session
 
 from .db import state
 from .judges import score_case
+from .leases import LeaseLost, fence
 from .models import Run, RunCase
 from .quota import settle_run
 from .secrets import decrypt_api_key
@@ -68,7 +69,7 @@ async def call_model(
     return text, tokens_in, tokens_out
 
 
-async def _execute_cases(run: Run, session: Session, cases: list) -> int:
+async def _execute_cases(run: Run, session: Session, cases: list, protect, attempt: str) -> int:
     """Run every case through model + judge. Returns the number of OK cases.
 
     Each case row is flushed and committed immediately: the write
@@ -113,14 +114,15 @@ async def _execute_cases(run: Run, session: Session, cases: list) -> int:
                     row.tokens_in = t_in
                     row.tokens_out = t_out
                     if state.storage is not None and run.id:
-                        state.storage.put_json(
-                            f"runs/{run.id}/case_{seq}/output.json",
+                        row.output_key = state.storage.put_json(
+                            f"runs/{run.id}/attempts/{attempt}/case_{seq}/output.json",
                             {"output": output, "score": score.__dict__},
                         )
                     ok_cases += 1
                 except Exception as exc:  # noqa: BLE001
                     # Execution error: case is not charged (see settle_run).
                     row.error = f"{type(exc).__name__}: {exc}"
+                protect(session)
                 session.add(row)
                 session.commit()  # short transaction: release the write lock now
     finally:
@@ -128,11 +130,19 @@ async def _execute_cases(run: Run, session: Session, cases: list) -> int:
     return ok_cases
 
 
-async def execute_run(run_id: int) -> None:
+async def execute_run(
+    run_id: int, *, job_id: int | None = None, lease_token: str | None = None
+) -> None:
     """Drive a single run to done/failed. Called by the worker."""
     session = state.session_factory()
     run = None
+
+    def protect(session):
+        if job_id is not None:
+            fence(session, job_id, lease_token)
+
     try:
+        protect(session)
         run = session.get(Run, run_id)
         if run is None:
             return
@@ -153,8 +163,9 @@ async def execute_run(run_id: int) -> None:
         # cases only); a failed run's reservation is fully refunded. The
         # ledger settles against the reservation's own period and is
         # idempotent — a re-settlement after a crash is a no-op.
-        ok_cases = await _execute_cases(run, session, cases)
+        ok_cases = await _execute_cases(run, session, cases, protect, lease_token or uuid4().hex)
 
+        protect(session)
         run.status = "done"
         run.finished_at = datetime.now(timezone.utc).replace(tzinfo=None)
         cases_rows = session.query(RunCase).filter(RunCase.run_id == run.id).all()
@@ -166,10 +177,16 @@ async def execute_run(run_id: int) -> None:
         run.total_cost_usd = 0.0  # metered by usage; cost accounting in v1
         settle_run(session, run_id=run.id, charged=ok_cases, success=True)
         session.commit()
+    except LeaseLost:
+        session.rollback()
     except Exception as exc:  # noqa: BLE001
         if run is not None:
             with contextlib.suppress(Exception):  # rollback may fail if connection is dead
                 session.rollback()
+            try:
+                protect(session)
+            except LeaseLost:
+                return
             # Refund the reservation (idempotent) and PERSIST the terminal
             # status — commit before the session closes.
             run.status = "failed"
