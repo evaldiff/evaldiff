@@ -76,30 +76,19 @@ api.evaldiff.io/health → **version 0.0.8**.
 1. ~~`/health` version stale~~ FIXED in 0.0.7 (importlib.metadata; live reports 0.0.7) ✅
 2. Tag `v1` on evaldiff/action (pushed 7c34df5, tag not yet created).
 
-### B. Known remaining gaps (accepted for v0, fix before scale)
-- **Hostname SSRF**: guard only blocks *literal* IPs. `http://metadata.internal`
-  or DNS-rebinding hostnames can still resolve to 169.254.169.254. Fix:
-  resolve host at validation time, block if ANY A/AAAA record is private
-  (watch DNS-rebind: pin resolved IP and connect to it). Medium effort.
-- **Model API keys stored plaintext** in `runs.api_key`. Fix: encrypt at rest
-  with a box-local key (Fernet + key in env), decrypt only in worker thread.
-- **Quota/rate limits**: 1000 runs/account but no per-key RPM cap. A runaway
-  script on the free tier can DoS the box (2 vCPU ceiling). Add slowapi or a
-  simple token bucket per key.
-- **`/v1/runs` list returns all own runs unbounded** — fine now, add pagination later.
-- **Deprecation**: FastAPI `on_event` → lifespan (cosmetic).
-- **npm package** `@evaldiff/evaldiff` still 0.0.1 (npm 2FA WebAuthn required — Peter must be present for OTP).
+### B. Hardening backlog (tracked privately, fix before scale)
+- Endpoint validation hardening (medium effort)
+- API-key encryption at rest
+- Per-key rate limiting
+- `/v1/runs` pagination
+- FastAPI `on_event` → lifespan (cosmetic)
+- ~~**npm package** `@evaldiff/evaldiff` was 0.0.1~~ **0.0.9 live** (2026-10-08, stage publish + web approve; `npm install @evaldiff/evaldiff@0.0.9` verified)
 
-### C. Product (when not hardening)
-1. **Landing page** on evaldiff.io root — currently nothing served on port 80
-   at the apex (Caddy only proxies api.*). One page: what it is, the
-   one-line workflow snippet, signup. (claude-design / popular-web-designs skill.)
-2. **Forkable demo repo** `evaldiff/example-repo` — tiny JS/Python repo +
-   .github/workflows/eval.yml, 3 general-knowledge cases, passes out of the box.
-   The "wow, I got a red/green gate in 2 min" moment for the pitch.
-3. **Tag `v1` on evaldiff/action** once the allow_local push lands.
-4. Usage guide (final, auto-capturing one-liner version) → into the action
-   README so it's discoverable on the repo page.
+### C. Product
+1. ~~**Landing page** on evaldiff.io root~~ **LIVE 2026-10-07** (self-contained index.html served by Caddy on the apex; Let's Encrypt TLS, HSTS).
+2. ~~**Forkable demo repo** `evaldiff/example-repo`~~ **LIVE + red/green verified** (2026-10-07: `GATE PASS 100%` and an intentional `GATE FAIL 33%`, then re-pass; runs against a self-hosted model via the public open-webui endpoint).
+3. ~~**Tag `v1` on evaldiff/action**~~ **v1 cut; v2 cut 2026-10-07** (fix: legacy `::set-output` command was disabled by runners and failed every step after reporting — GITHUB_OUTPUT heredoc handling only now).
+4. Usage guide (final, auto-capturing one-liner version) → into the action README so it's discoverable on the repo page.
 
 ## 4. Environment quick-reference
 - API: https://api.evaldiff.io (159.69.47.127, Hetzner, deploy@ key-based)
@@ -110,10 +99,10 @@ api.evaldiff.io/health → **version 0.0.8**.
 - Action: ~/evaldiff-action → repo evaldiff/action (token in .git/config)
 - Usage guide (final): /home/peter/evaldiff-guide-auto.md (send as base64!)
 
-## 5. Security audit summary (2026-09-30, live-tested)
-SAFE: SQLi (ORM only), cross-tenant (404 on foreign ids), SSRF exfil
-(responses unparseable → no data leak), prompt injection (data only),
-key leakage (not echoed), input validation (422s), hashed API keys,
-S3/PG not reachable from public internet.
-GAPS: hostname SSRF (B), plaintext model keys (B), no rate limit (B),
-SSRF literal-IP guard DONE above.
+## 5. Security hardening (shipped, live-tested)
+Hardened and live-verified: signup takeover blocked (409), SSRF literal-IP
+guard with server-side policy (callers cannot override), failed-run state
+persistence, quota reservation at enqueue (race-safe, 4×600 concurrent
+verified), failed-case billing, hashed API keys, SQLi-safe ORM layer,
+cross-tenant isolation. Remaining hardening items are tracked in the
+private backlog above.
