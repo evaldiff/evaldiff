@@ -41,3 +41,11 @@ class Settings(BaseSettings):
     # 0 (or below) disables.
     signup_rate_per_min: float = 5
     signup_burst: int = 5
+
+    # Response limits for model and judge HTTP calls (NEEDS-DOING A): a
+    # hostile or broken upstream must not exhaust worker memory (byte cap
+    # on the decoded body) or pin a worker (idle timeout between chunks).
+    # Apply over plain HTTP and HTTPS (the SSRF-guard tunnel). 0 disables
+    # the byte cap; 0 idle timeout disables the stall detection.
+    response_max_bytes: int = 16_000_000
+    response_idle_timeout: float = 10.0

@@ -26,6 +26,7 @@ import httpx
 from sqlalchemy.orm import Session
 
 from .db import state
+from .http_limits import post_json_bounded
 from .judges import score_case
 from .leases import LeaseLost, fence
 from .models import Run, RunCase
@@ -59,9 +60,11 @@ async def call_model(
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0,
     }
-    resp = await client.post(url, json=body, headers=headers, timeout=timeout)
-    resp.raise_for_status()
-    data = resp.json()
+    # Bounded read: byte cap + idle timeout on the decoded body (NEEDS-DOING
+    # A). Deterministic violations raise ResponseLimitExceeded /
+    # ResponseStalled — NOT httpx.TransportError, so _with_retries won't
+    # retry them, and the case is not charged.
+    data = await post_json_bounded(client, url, body=body, headers=headers, timeout=timeout)
     text = data["choices"][0]["message"]["content"] or ""
     usage = data.get("usage") or {}
     tokens_in = int(usage.get("prompt_tokens") or 0)

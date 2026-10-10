@@ -7,6 +7,8 @@ from dataclasses import dataclass
 
 import httpx
 
+from .http_limits import post_json_bounded
+
 
 @dataclass
 class Score:
@@ -83,9 +85,10 @@ async def rubric_llm(
         "temperature": 0,
         "messages": [{"role": "user", "content": prompt}],
     }
-    resp = await client.post(url, json=body, headers=headers, timeout=timeout)
-    resp.raise_for_status()
-    data = resp.json()
+    # Bounded read: same byte/idle caps as the model path (NEEDS-DOING A).
+    # ResponseLimitExceeded / ResponseStalled propagate without retry and
+    # the case is not charged (deterministic, not transient).
+    data = await post_json_bounded(client, url, body=body, headers=headers, timeout=timeout)
     content = data["choices"][0]["message"]["content"]
     verdicts = _parse_verdicts(content)
     # Match by criterion identity, allowing reordered verdicts but never
