@@ -2,18 +2,21 @@
 
 ## 0. Current status
 
-Package metadata is at **0.0.13**. The current code includes run pagination,
-FastAPI lifespan startup, and the review fixes for plain-HTTP response limits,
-invalid run comparisons, and duplicate rubric verdicts. Latest local validation:
-**68 tests passed**, including 16 review regression tests; lint and formatting
-checks passed. PostgreSQL-specific validation and the deployed state were not
-verified in this review. Historical release notes below are historical evidence,
-not confirmation of the current deployment.
+Package metadata is at **0.0.14** (live on PyPI, api.evaldiff.io, npm staged
+awaiting approval). 0.0.14 ships section 3A — bounded model/judge response
+reads: shared `post_json_bounded()` with a decoded-byte cap (16 MiB default,
+`EVALDIFF_RESPONSE_MAX_BYTES`), an idle-stall timeout (10 s default,
+`EVALDIFF_RESPONSE_IDLE_TIMEOUT`), early rejection of declared-huge bodies,
+and stream close on violation (tunnel teardown). 11 new integration tests
+(HTTP/HTTPS, model+judge, chunked/EOF/compressed/oversized, stalled,
+declared-huge, full-stack worker survival); **79/79 tests pass, ruff clean,
+CI green** on 85b9db6. Latest local validation: **79 tests passed**,
+including 11 section-A regression tests; lint and formatting checks passed.
 
 Readiness assessment: suitable for a controlled internal pilot with trusted
 endpoints after deployment checks; **public production readiness is not yet
-established**. Complete sections 3A–3D before public rollout. Section 3E is also
-required before advertising the complete CLI/CI workflow.
+established**. Complete sections 3B–3D before public rollout. Section 3E is
+also required before advertising the complete CLI/CI workflow.
 
 ## 1. Release history
 
@@ -85,30 +88,30 @@ api.evaldiff.io/health → **version 0.0.8**.
 
 ## 3. TO DO next (in priority order)
 
-### A. Bound model and judge responses over HTTP and HTTPS
+### A. Bound model and judge responses over HTTP and HTTPS — ✅ SHIPPED 0.0.14 (2026-10-10)
 
-Files: `api/runner.py`, `api/judges.py`, `api/settings.py`, `api/ssrf_guard.py`.
+Files: `api/http_limits.py` (new), `api/runner.py`, `api/judges.py`,
+`api/settings.py`, `tests/test_response_limits.py` (new).
 
-- [ ] Add one shared streamed-response reader for model and judge calls, with a
-  configurable byte limit and an idle-stall timeout (a slow-drip upstream under
-  the cap must not pin a worker indefinitely). Enforce it before JSON parsing
-  for both HTTP and HTTPS; retain TLS certificate verification and the dial-time
-  SSRF guard.
-- [ ] Bound decoded response bytes as well as wire bytes so compression cannot
-  bypass the memory limit. Reject oversized declared lengths early, but never
-  rely solely on `Content-Length` (it can be missing or inaccurate).
-- [ ] Close responses promptly on limit errors, idle-stall timeout, and
-  cancellation; on a limit also tear down the proxy/CONNECT tunnel so a bounded
-  response cannot keep a long-lived tunnel open. Record a clear case error and
-  avoid retrying deterministic size violations or charging the failed case.
-  Keep the proxy's existing plain-HTTP cap as an additional bound.
+- [x] One shared streamed-response reader (`post_json_bounded`) for model and
+  judge calls: configurable byte limit + idle-stall timeout, enforced before
+  JSON parsing, over HTTP and HTTPS (SSRF-guard CONNECT tunnel); TLS cert
+  verification and the dial-time SSRF guard retained.
+- [x] Cap on *decoded* bytes (httpx decodes Content-Encoding before yielding
+  chunks, so compression cannot bypass it); declared-huge identity bodies
+  rejected early; never relies solely on `Content-Length`.
+- [x] Stream closed on cap/stall/error (finally-block), which tears down the
+  proxy/CONNECT tunnel; clear case error, deterministic violations are NOT
+  retried (not `httpx.TransportError`) and NOT charged; proxy's plain-HTTP cap
+  kept as an additional bound.
 
-Acceptance: integration tests cover HTTP and HTTPS, model and judge responses,
-chunked and EOF-delimited bodies, compressed payloads, oversized headers, and a
-stalled stream (idle under the byte cap) that must time out and free the worker.
-Valid responses at the limit succeed; excessive or stalled responses fail without
-an unbounded allocation and close their tunnel. A subsequent queued run can still
-complete.
+Acceptance: met — `tests/test_response_limits.py` covers HTTP and HTTPS,
+model and judge, chunked and EOF-delimited bodies, compressed payloads,
+declared-huge rejection, a stalled stream (idle under the cap) that times out
+and frees the worker, in-limit success with a usable client afterwards, and a
+full-stack run where an over-cap case records an error, the run finishes, and a
+subsequent queued run completes. 11 tests; 79/79 suite green; CI green
+(85b9db6). Live: PyPI 0.0.14, api.evaldiff.io `/health` → 0.0.14, npm staged.
 
 ### B. Require encryption in production deployments
 
