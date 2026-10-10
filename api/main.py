@@ -413,7 +413,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         # diff semantics: run_id = NEW run (B), compare = BASE run (A)
         run_b = _get_own_run(session, run_id, account)
         run_a = _get_own_run(session, compare, account)
-        d = compute_diff(session, run_a, run_b)
+        d = _validated_diff(session, run_a, run_b)
         d.cases.sort(key=lambda c: c.seq)
         return {
             "summary": d.summary,
@@ -434,7 +434,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         else:
             # diff semantics: run_id = NEW run (B), compare = BASE run (A)
             run_a = _get_own_run(session, compare, account)
-            md = diff_to_markdown(compute_diff(session, run_a, run))
+            md = diff_to_markdown(_validated_diff(session, run_a, run))
         return Response(content=md, media_type="text/markdown")
 
     # ---------- usage ----------
@@ -455,6 +455,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         )
 
     return app
+
+
+def _validated_diff(session: Session, a: Run, b: Run):
+    try:
+        return compute_diff(session, a, b)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
 
 
 def _get_own_run(session: Session, run_id: int, account: Account) -> Run:

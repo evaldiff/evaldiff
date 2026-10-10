@@ -48,6 +48,10 @@ class RunDiff:
 
 
 def compute_diff(session: Session, a: Run, b: Run, regression_drop: float = 0.1) -> RunDiff:
+    if a.status != "done" or b.status != "done":
+        raise ValueError("both runs must be done before comparison")
+    if a.dataset_id != b.dataset_id:
+        raise ValueError("runs must use the same dataset")
     a_map = {c.seq: c for c in a.cases}
     b_map = {c.seq: c for c in b.cases}
     out = RunDiff(a=a.id, b=b.id, a_avg=a.avg_score, b_avg=b.avg_score)

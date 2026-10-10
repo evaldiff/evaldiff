@@ -88,15 +88,17 @@ async def rubric_llm(
     data = resp.json()
     content = data["choices"][0]["message"]["content"]
     verdicts = _parse_verdicts(content)
-    # Strict scoring: match verdicts to rubric criteria by index. Each
-    # criterion needs a well-formed entry with a real boolean ``passed``.
-    # The denominator is always len(rubric) — a judge that drops or
-    # mangles entries can only lower a score, never raise it.
+    # Match by criterion identity, allowing reordered verdicts but never
+    # counting duplicate verdicts as evidence for an unjudged criterion.
     n = len(rubric)
+    by_criterion: dict[str, list[dict]] = {}
+    for verdict in verdicts:
+        if isinstance(verdict, dict) and isinstance(verdict.get("criterion"), str):
+            by_criterion.setdefault(verdict["criterion"], []).append(verdict)
     hits = 0
-    for i, criterion in enumerate(rubric):
-        v = verdicts[i] if i < len(verdicts) else None
-        if isinstance(v, dict) and v.get("passed") is True:
+    for criterion in rubric:
+        matches = by_criterion.get(criterion, [])
+        if len(matches) == 1 and matches[0].get("passed") is True:
             hits += 1
     score = hits / n if n else 0.0
     return Score(
@@ -116,7 +118,7 @@ def _parse_verdicts(content: str) -> list[dict]:
         data = json.loads(content)
     except json.JSONDecodeError:
         return []
-    v = data.get("verdicts")
+    v = data.get("verdicts") if isinstance(data, dict) else None
     return v if isinstance(v, list) else []
 
 

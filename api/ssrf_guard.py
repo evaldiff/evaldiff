@@ -147,81 +147,71 @@ def _read_headers(sock: socket.socket) -> tuple[list[bytes], dict[str, str]]:
     return raw, headers
 
 
+class ResponseTooLarge(OSError):
+    """The upstream HTTP response exceeded the buffering limit."""
+
+
 def _read_response(sock: socket.socket, cap: int = 64 * 1024 * 1024) -> bytes:
-    """Read a complete HTTP/1.1 response (content-length, chunked, or EOF-bounded)."""
+    """Read a framed response, bounding headers, body, and trailers together."""
     out = bytearray()
-    # headers
-    while True:
-        line = b""
-        while not line.endswith(b"\n"):
-            byte = sock.recv(1)
-            if not byte:
-                return bytes(out)
-            line += byte
-        line = line.rstrip(b"\r\n")
-        out += line + b"\r\n"
-        if line == b"":
-            break
-    htxt = bytes(out).decode("latin1", "replace").lower()
-    if "content-length:" in htxt:
-        n = int(htxt.split("content-length:", 1)[1].split("\r\n", 1)[0].strip())
-        need = n
-        got = 0
-        while got < need:
-            chunk = sock.recv(min(65536, need - got))
-            if not chunk:
-                break
-            out += chunk
-            got += len(chunk)
-        return bytes(out)
-    if "transfer-encoding:" in htxt and "chunked" in htxt:
-        # de-chunk by reading until the terminal zero chunk
+
+    def receive(n: int) -> bytes:
+        data = sock.recv(min(n, max(1, cap - len(out) + 1)))
+        if len(out) + len(data) > cap:
+            raise ResponseTooLarge("upstream response exceeds size limit")
+        out.extend(data)
+        return data
+
+    def line() -> bytes:
+        start = len(out)
         while True:
-            size_line = b""
-            while not size_line.endswith(b"\r\n"):
-                byte = sock.recv(1)
-                if not byte:
-                    return bytes(out)
-                size_line += byte
-            n = int(size_line.strip().split(b";")[0] or b"0", 16)
-            out += size_line
-            if n == 0:
-                # trailers up to blank line
-                while True:
-                    tl = b""
-                    while not tl.endswith(b"\r\n"):
-                        byte = sock.recv(1)
-                        if not byte:
-                            return bytes(out)
-                        tl += byte
-                    out += tl
-                    if tl in (b"\r\n", b"\n"):
-                        break
-                return bytes(out)
-            chunk = b""
-            while len(chunk) < n:
-                c = sock.recv(min(65536, n - len(chunk)))
-                if not c:
-                    break
-                chunk += c
-            out += chunk
-            crlf = b""
-            while not crlf.endswith(b"\n"):
-                byte = sock.recv(1)
-                if not byte:
-                    break
-                crlf += byte
-            out += crlf
-            if len(out) > cap:
-                return bytes(out)
-    # no framing: read to EOF (bounded)
+            byte = receive(1)
+            if not byte or byte == b"\n":
+                return bytes(out[start:])
+
+    def body(n: int) -> None:
+        if n < 0:
+            raise OSError("negative response length")
+        if n > cap - len(out):
+            raise ResponseTooLarge("upstream response exceeds size limit")
+        while n:
+            data = receive(min(65536, n))
+            if not data:
+                raise OSError("incomplete upstream response")
+            n -= len(data)
+
+    headers = {}
     while True:
-        chunk = sock.recv(65536)
-        if not chunk:
+        raw = line()
+        if not raw:
+            raise OSError("incomplete upstream headers")
+        if raw in (b"\r\n", b"\n"):
             break
-        out += chunk
-        if len(out) > cap:
-            break
+        if b":" in raw:
+            key, value = raw.split(b":", 1)
+            headers[key.strip().lower()] = value.strip().lower()
+    try:
+        # Transfer-Encoding takes precedence over Content-Length.
+        if b"chunked" in headers.get(b"transfer-encoding", b""):
+            while True:
+                size = int(line().strip().split(b";")[0], 16)
+                if size == 0:
+                    while True:
+                        trailer = line()
+                        if not trailer:
+                            raise OSError("incomplete upstream trailers")
+                        if trailer in (b"\r\n", b"\n"):
+                            return bytes(out)
+                body(size)
+                if line() != b"\r\n":
+                    raise OSError("invalid chunk terminator")
+        if b"content-length" in headers:
+            body(int(headers[b"content-length"]))
+        else:
+            while receive(65536):
+                pass
+    except ValueError as exc:
+        raise OSError("invalid upstream response length") from exc
     return bytes(out)
 
 
