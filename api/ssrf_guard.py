@@ -306,7 +306,7 @@ def _read_response(
                     raise OSError("incomplete upstream response")
                 continue
             prev = buf.rfind(b"\n", 0, nl)
-            line = bytes(buf[prev + 1:nl])
+            line = bytes(buf[prev + 1 : nl])
             idx = nl + 1
             if line in (b"", b"\r"):  # blank separator line
                 header_done = True
@@ -361,7 +361,7 @@ def _read_response(
                 if not receive(2) and not eof_ok(state, idx, headers, size, remaining):
                     raise OSError("incomplete upstream response")
                 continue
-            if bytes(buf[idx:idx + 2]) != b"\r\n":
+            if bytes(buf[idx : idx + 2]) != b"\r\n":
                 raise OSError("invalid chunk terminator")
             idx += 2
             state = "csize" if size else "ctrail"
@@ -373,7 +373,7 @@ def _read_response(
                     raise OSError("incomplete upstream response")
                 continue
             prev = buf.rfind(b"\n", 0, nl)
-            line = bytes(buf[prev + 1:nl])
+            line = bytes(buf[prev + 1 : nl])
             idx = nl + 1
             if line in (b"", b"\r"):  # terminating blank line
                 state = "done"

@@ -254,9 +254,7 @@ async def read_capped_body(response: httpx.Response, *, max_bytes: int) -> bytes
         _accept_chunk(chunk, decoder=decoder, out=out, max_bytes=max_bytes)
     while aiter is not None:
         try:
-            chunk = await asyncio.wait_for(
-                aiter.__anext__(), timeout=idle if idle > 0 else None
-            )
+            chunk = await asyncio.wait_for(aiter.__anext__(), timeout=idle if idle > 0 else None)
         except StopAsyncIteration:
             break
         except asyncio.TimeoutError:
@@ -324,7 +322,9 @@ async def post_json_bounded(
             try:
                 response.raise_for_status()
             except httpx.HTTPStatusError as exc:
-                marker = exc.response.headers.get(_GUARD_HEADER, "") if exc.response is not None else ""
+                marker = (
+                    exc.response.headers.get(_GUARD_HEADER, "") if exc.response is not None else ""
+                )
                 if marker == "ResponseTooLarge":
                     raise ResponseLimitExceeded(
                         "upstream response exceeds the SSRF proxy's size limit"

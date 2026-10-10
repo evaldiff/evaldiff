@@ -16,7 +16,6 @@ import socket
 import threading
 import time
 import zlib
-from typing import Self
 
 import httpx
 import pytest
@@ -98,7 +97,9 @@ def test_gzip_within_cap_is_decoded_correctly() -> None:
     wire = gzip.compress(payload)
 
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, stream=httpx.ByteStream(wire), headers={"Content-Encoding": "gzip"})
+        return httpx.Response(
+            200, stream=httpx.ByteStream(wire), headers={"Content-Encoding": "gzip"}
+        )
 
     async def go() -> dict:
         return await hl.post_json_bounded(
@@ -120,7 +121,9 @@ def test_raw_deflate_within_cap_is_decoded() -> None:
     wire = co.compress(payload) + co.flush()
 
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, stream=httpx.ByteStream(wire), headers={"Content-Encoding": "deflate"})
+        return httpx.Response(
+            200, stream=httpx.ByteStream(wire), headers={"Content-Encoding": "deflate"}
+        )
 
     async def go() -> dict:
         return await hl.post_json_bounded(
@@ -252,11 +255,7 @@ def test_proxy_releases_upstream_when_client_disappears() -> None:
         holder_state["conn"] = conn
         # Pre-fill the send buffer: headers + 1 KiB of a declared 1 MiB
         # body. The rest is never sent — the holder just holds the socket.
-        conn.sendall(
-            b"HTTP/1.1 200 OK\r\n"
-            b"Content-Length: 1048576\r\n"
-            b"\r\n" + b"y" * 1024
-        )
+        conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 1048576\r\n\r\n" + b"y" * 1024)
         conn.settimeout(None)
         try:
             while True:
@@ -351,7 +350,9 @@ def test_proxy_upstream_stall_becomes_tagged_502() -> None:
                 daemon=True,
             )
             handler.start()
-            client_sock.sendall(b"GET http://model.example/ HTTP/1.1\r\nHost: model.example\r\n\r\n")
+            client_sock.sendall(
+                b"GET http://model.example/ HTTP/1.1\r\nHost: model.example\r\n\r\n"
+            )
             handler.join(timeout=5.0)
             elapsed = time.monotonic() - t0
             client_sock.settimeout(2.0)
@@ -381,12 +382,14 @@ def test_proxy_upstream_stall_becomes_tagged_502() -> None:
 class mock_dial:
     """Patch SSRFGuard._dial to a pre-connected socket (or target)."""
 
-    def __init__(self, upstream_sock: socket.socket | None = None, target: str | None = None) -> None:
+    def __init__(
+        self, upstream_sock: socket.socket | None = None, target: str | None = None
+    ) -> None:
         self.upstream_sock = upstream_sock
         self.target = target
         self._orig = None
 
-    def __enter__(self) -> Self:
+    def __enter__(self) -> "mock_dial":  # noqa: PYI034,UP037  (no typing_extensions dep on 3.10)
         import api.ssrf_guard as g
 
         self._orig = g._dial
