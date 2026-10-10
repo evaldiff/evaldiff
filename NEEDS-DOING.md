@@ -2,8 +2,8 @@
 
 ## 0. Current status
 
-Package metadata is at **0.0.15** (live on PyPI, api.evaldiff.io, npm staged
-awaiting approval). 0.0.15 ships the section A P1/P2 review fixes:
+Package metadata is at **0.0.15** (live on PyPI, api.evaldiff.io, and npm
+latest). 0.0.15 ships the section A P1/P2 review fixes:
 decompression bounded *during* decode (64 KiB window), proxy observes client
 disconnect on a 0.25 s tick and releases the upstream socket, stalled upstream
 hits the idle window, proxy-violation 502s become non-retryable
@@ -300,5 +300,5 @@ releases upstream socket when client disappears (holder sees EOF, thread
 terminates), proxy upstream stall → tagged 502 within the idle window.
 
 **Shipped:** full suite 87 passed, ruff clean, CI green (76ceddd), PyPI
-0.0.15 live, api.evaldiff.io `/health` → 0.0.15, npm staged
-(id 3f9ed97a — Peter approves on npmjs.com).
+0.0.15 live, api.evaldiff.io `/health` → 0.0.15, npm 0.0.15 approved +
+latest (id 3f9ed97a, approved by Peter).
