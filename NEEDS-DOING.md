@@ -2,16 +2,15 @@
 
 ## 0. Current status
 
-Package metadata is at **0.0.14** (live on PyPI, api.evaldiff.io, npm staged
-awaiting approval). 0.0.14 ships section 3A — bounded model/judge response
-reads: shared `post_json_bounded()` with a decoded-byte cap (16 MiB default,
-`EVALDIFF_RESPONSE_MAX_BYTES`), an idle-stall timeout (10 s default,
-`EVALDIFF_RESPONSE_IDLE_TIMEOUT`), early rejection of declared-huge bodies,
-and stream close on violation (tunnel teardown). 11 new integration tests
-(HTTP/HTTPS, model+judge, chunked/EOF/compressed/oversized, stalled,
-declared-huge, full-stack worker survival); **79/79 tests pass, ruff clean,
-CI green** on 85b9db6. Latest local validation: **79 tests passed**,
-including 11 section-A regression tests; lint and formatting checks passed.
+Package metadata is at **0.0.15** (live on PyPI, api.evaldiff.io, npm staged
+awaiting approval). 0.0.15 ships the section A P1/P2 review fixes:
+decompression bounded *during* decode (64 KiB window), proxy observes client
+disconnect on a 0.25 s tick and releases the upstream socket, stalled upstream
+hits the idle window, proxy-violation 502s become non-retryable
+`ResponseLimitExceeded`/`ResponseStalled` (case not charged), and
+`_read_response` rewritten as a frame-aware state machine (declared-over-cap
+rejected at declaration; complete-at-cap responses preserved).
+**87/87 tests pass, ruff clean, CI green on 76ceddd.**
 
 Readiness assessment: suitable for a controlled internal pilot with trusted
 endpoints after deployment checks; **public production readiness is not yet
@@ -300,5 +299,6 @@ stalled (1 call, no retry), plain 502 still retried (2 calls), proxy
 releases upstream socket when client disappears (holder sees EOF, thread
 terminates), proxy upstream stall → tagged 502 within the idle window.
 
-**Shipped:** full suite 87 passed, ruff clean, `v0.0.15` pushed → CI →
-publish (PyPI + npm + Hetzner) — see 0.0.15 release notes for verification.
+**Shipped:** full suite 87 passed, ruff clean, CI green (76ceddd), PyPI
+0.0.15 live, api.evaldiff.io `/health` → 0.0.15, npm staged
+(id 3f9ed97a — Peter approves on npmjs.com).
