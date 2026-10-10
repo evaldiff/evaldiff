@@ -90,19 +90,25 @@ api.evaldiff.io/health → **version 0.0.8**.
 Files: `api/runner.py`, `api/judges.py`, `api/settings.py`, `api/ssrf_guard.py`.
 
 - [ ] Add one shared streamed-response reader for model and judge calls, with a
-  configurable byte limit. Enforce it before JSON parsing for both HTTP and
-  HTTPS; retain TLS certificate verification and the dial-time SSRF guard.
+  configurable byte limit and an idle-stall timeout (a slow-drip upstream under
+  the cap must not pin a worker indefinitely). Enforce it before JSON parsing
+  for both HTTP and HTTPS; retain TLS certificate verification and the dial-time
+  SSRF guard.
 - [ ] Bound decoded response bytes as well as wire bytes so compression cannot
   bypass the memory limit. Reject oversized declared lengths early, but never
   rely solely on `Content-Length` (it can be missing or inaccurate).
-- [ ] Close responses promptly on limit errors and cancellation. Record a clear
-  case error and avoid retrying deterministic size violations or charging the
-  failed case. Keep the proxy's existing plain-HTTP cap as an additional bound.
+- [ ] Close responses promptly on limit errors, idle-stall timeout, and
+  cancellation; on a limit also tear down the proxy/CONNECT tunnel so a bounded
+  response cannot keep a long-lived tunnel open. Record a clear case error and
+  avoid retrying deterministic size violations or charging the failed case.
+  Keep the proxy's existing plain-HTTP cap as an additional bound.
 
 Acceptance: integration tests cover HTTP and HTTPS, model and judge responses,
-chunked and EOF-delimited bodies, compressed payloads, and oversized headers.
-Valid responses at the limit succeed; excessive responses fail without an
-unbounded allocation. A subsequent queued run can still complete.
+chunked and EOF-delimited bodies, compressed payloads, oversized headers, and a
+stalled stream (idle under the byte cap) that must time out and free the worker.
+Valid responses at the limit succeed; excessive or stalled responses fail without
+an unbounded allocation and close their tunnel. A subsequent queued run can still
+complete.
 
 ### B. Require encryption in production deployments
 
@@ -160,7 +166,9 @@ Depends on A–C for final release qualification.
 - [ ] Exercise concurrent quota reservations, settlement, month boundaries,
   lease recovery, and legacy migration on PostgreSQL. Test the intended number
   of app/worker processes and simultaneous startup; serialize migrations if
-  concurrent startup exposes a race.
+  concurrent startup exposes a race. Specifically start two app processes at
+  once against the same DB and assert the one-time `migrate_legacy_usage` runs
+  exactly once without dropping or double-counting a legacy row.
 - [ ] Deploy the exact candidate artifact to staging with PostgreSQL,
   SeaweedFS, Caddy, and production settings. Verify signup, encrypted keys,
   dataset upload, HTTPS model calls, diff/report output, and real client-IP
