@@ -1,17 +1,19 @@
-# evaldiff — NEEDS-DOING (updated 2026-10-08)
+# evaldiff — NEEDS-DOING (updated 2026-10-10)
 
 ## 0. Current status
 
-The repository is at 0.0.11, with follow-up reliability and hardening fixes
-implemented locally but **not committed, published, or deployed**. Local
-validation: **50 tests pass**, including 15 new regression tests; lint and
-formatting checks pass. PostgreSQL coverage is configured in CI but has not
-been run locally. Historical release notes below describe earlier verification,
-not the current deployment state.
+Package metadata is at **0.0.13**. The current code includes run pagination,
+FastAPI lifespan startup, and the review fixes for plain-HTTP response limits,
+invalid run comparisons, and duplicate rubric verdicts. Latest local validation:
+**68 tests passed**, including 16 review regression tests; lint and formatting
+checks passed. PostgreSQL-specific validation and the deployed state were not
+verified in this review. Historical release notes below are historical evidence,
+not confirmation of the current deployment.
 
-Next product milestone: **a developer can catch and understand a regression
-in five minutes**. Ship the CLI workflow and useful failure reports together,
-then add named baselines. Keep detailed security findings in the private tracker.
+Readiness assessment: suitable for a controlled internal pilot with trusted
+endpoints after deployment checks; **public production readiness is not yet
+established**. Complete sections 3A–3D before public rollout. Section 3E is also
+required before advertising the complete CLI/CI workflow.
 
 ## 1. Release history
 
@@ -83,55 +85,140 @@ api.evaldiff.io/health → **version 0.0.8**.
 
 ## 3. TO DO next (in priority order)
 
-### A. Finish the current reliability release
+### A. Bound model and judge responses over HTTP and HTTPS
 
-- [ ] Review and commit the local quota, recovery, HTTPS, and rate-limit fixes.
-- [ ] Run CI, including the PostgreSQL quota/recovery tests, before publishing.
-- [ ] Publish the release and update deployment pins to the tested version.
-- [ ] Follow [the upgrade instructions](deploy/UPGRADING.md): stop old workers
-  before starting the updated application and its one-time usage migration.
-- [ ] Verify the deployed version and an end-to-end evaluation after rollout.
+Files: `api/runner.py`, `api/judges.py`, `api/settings.py`, `api/ssrf_guard.py`.
 
-### B. Next milestone: CLI workflow + actionable failure reports
+- [ ] Add one shared streamed-response reader for model and judge calls, with a
+  configurable byte limit. Enforce it before JSON parsing for both HTTP and
+  HTTPS; retain TLS certificate verification and the dial-time SSRF guard.
+- [ ] Bound decoded response bytes as well as wire bytes so compression cannot
+  bypass the memory limit. Reject oversized declared lengths early, but never
+  rely solely on `Content-Length` (it can be missing or inaccurate).
+- [ ] Close responses promptly on limit errors and cancellation. Record a clear
+  case error and avoid retrying deterministic size violations or charging the
+  failed case. Keep the proxy's existing plain-HTTP cap as an additional bound.
 
-Ship these two features together:
+Acceptance: integration tests cover HTTP and HTTPS, model and judge responses,
+chunked and EOF-delimited bodies, compressed payloads, and oversized headers.
+Valid responses at the limit succeed; excessive responses fail without an
+unbounded allocation. A subsequent queued run can still complete.
 
-1. **Finish the CLI workflow.** Implement `evaldiff run` and `evaldiff diff`,
-   with authentication, progress, timeouts, and reliable exit codes for CI.
-   Align the README quickstart with the implemented commands.
-2. **Show why a case failed.** Include input, expected answer, actual output,
-   and judge explanation in JSON and Markdown reports. Make the evidence
-   available after the run finishes so a failed gate is actionable.
+### B. Require encryption in production deployments
 
-Acceptance: extend the existing forkable demo with one complete CLI example.
-A developer should be able to run a passing baseline, deliberately change a
-prompt to introduce a regression, get a failing gate, and inspect enough
-evidence to diagnose it within five minutes. Put the usage guide in the action
-README so the workflow is discoverable.
+Files: `api/secrets.py`, `api/settings.py`, `api/main.py`,
+`deploy/docker-compose.yml`, `deploy/deploy.sh`, `deploy/UPGRADING.md`.
 
-### C. Following features, in order
+- [ ] Add an explicit production configuration that refuses startup when
+  `EVALDIFF_SECRET_KEY` is missing or invalid. Preserve documented local
+  development behavior without silently allowing plaintext in production.
+- [ ] Pass the key into the API container and validate required configuration
+  before deployment. Document generating and securely provisioning a stable
+  key; never commit it or include it in logs.
+- [ ] Provide an idempotent migration for existing plaintext model keys, with
+  backup and rollback instructions. Check encrypted values fit the database
+  column, including longer provider keys.
+- [ ] Document key backup, restoration, and rotation. Rotation must retain
+  access to previously encrypted values until migration is complete.
 
-1. **Named baselines.** Compare a candidate against the last approved run,
-   for example `evaldiff diff --baseline main` (proposed syntax). Record
-   dataset, prompt, model, and commit versions so comparisons are reproducible.
-2. **Model variability.** Support repeated evaluations and report score spread
-   to help users distinguish a regression from a flaky result before blocking
-   a release.
-3. **Deterministic checks.** Add JSON-schema validation, required fields,
-   regex matching, and numeric tolerances for structured-output evaluations.
+Acceptance: production startup fails for missing/invalid keys; new and migrated
+rows contain ciphertext; queued runs still execute after restart. Restore a
+backup with its matching key and verify decryption. Test wrong-key handling
+without exposing secrets.
 
-### D. Later / maintenance
+### C. Bound run duration and prevent queue starvation
 
-- Validate the core workflow with a few real users before building a large
-  dashboard. Learn whether the gate catches problems and whether users trust
-  its results enough to block releases.
-- `/v1/runs` pagination.
-- FastAPI `on_event` → lifespan.
-- Continue hardening from the private tracker. Endpoint filtering, model-key
-  encryption, and account/signup rate limiting are implemented; release
-  verification belongs in section A rather than a new-feature backlog.
+Files: `api/worker.py`, `api/runner.py`, `api/leases.py`, `api/quota.py`,
+`api/settings.py`.
 
-### E. Previously completed product work (recorded history)
+- [ ] Add configurable overall run deadlines in addition to per-request
+  timeouts. Define the budget across retries and reclaimed attempts so a crash
+  cannot reset it indefinitely.
+- [ ] On deadline expiry, cancel outstanding calls, release resources, persist
+  a terminal failure, and settle quota once according to the documented policy.
+  Preserve lease fencing when timeout, heartbeat loss, and recovery race.
+- [ ] Add bounded worker concurrency and per-account active/queued limits.
+  Schedule fairly across accounts so one large backlog cannot monopolize all
+  slots. Keep blocking database/storage work from starving lease heartbeats.
+- [ ] Preserve atomic claiming, independent database sessions per task, and
+  graceful shutdown. Start with conservative defaults and tune from load tests.
+
+Acceptance: a stalled endpoint reaches its deadline, resources close, and quota
+settles exactly once. Another account's fast run completes while the slow run
+is active. Concurrent workers never duplicate committed case results; shutdown
+and lease expiry recover work without stale writes or abandoned reservations.
+
+### D. Verify the production stack and prepare operations
+
+Files: `.github/workflows/ci.yml`, `tests/test_recovery_quota.py`, `deploy/`.
+Depends on A–C for final release qualification.
+
+- [ ] Run the complete suite against PostgreSQL using
+  `EVALDIFF_TEST_POSTGRES_URL` and a disposable database. Record the tested
+  commit, database/driver versions, commands, and results. Require the existing
+  PostgreSQL CI job to pass before release.
+- [ ] Exercise concurrent quota reservations, settlement, month boundaries,
+  lease recovery, and legacy migration on PostgreSQL. Test the intended number
+  of app/worker processes and simultaneous startup; serialize migrations if
+  concurrent startup exposes a race.
+- [ ] Deploy the exact candidate artifact to staging with PostgreSQL,
+  SeaweedFS, Caddy, and production settings. Verify signup, encrypted keys,
+  dataset upload, HTTPS model calls, diff/report output, and real client-IP
+  rate limiting end to end.
+- [ ] Correct deployment smoke checks: the API port is not published to the
+  host, so check it inside the container and check HTTPS through Caddy.
+  Fail deployment clearly when dependencies or readiness checks fail.
+- [ ] Add readiness checks and monitor queue age/depth, run failures/timeouts,
+  worker heartbeat health, memory, and database/storage errors. Redact keys and
+  avoid logging sensitive dataset/model payloads.
+- [ ] Automate database and object-storage backups; preserve the encryption key
+  separately. Restore into an isolated stack and verify data and key access.
+  Record recovery-time and data-loss targets and the measured restore result.
+- [ ] Run a load/soak test with mixed accounts, large datasets, slow/failing
+  endpoints, and worker restarts. Agree on queue-wait, API-latency, and memory
+  limits before the test; record whether the candidate meets them.
+- [ ] Publish the tested version and update the Dockerfile pin (it installs a
+  PyPI release, not the local checkout). Follow the upgrade instructions,
+  verify the deployed version, and document a tested rollback procedure.
+
+Acceptance: all required CI checks and staging scenarios pass, resource usage
+stays within the agreed budget, and restore/recovery drills succeed. Attach
+results to the release; do not infer production validation from SQLite tests.
+
+### E. Finish the CLI workflow and actionable reports
+
+Files: `evaldiff_cli/main.py`, `tests/test_cli.py`, `api/main.py`, `api/diff.py`,
+`api/storage.py`, `README.md`. Can proceed alongside A–D.
+
+- [ ] Implement `evaldiff run` with authentication, dataset upload, submission,
+  bounded polling, rate-limit handling, and useful progress/error messages.
+- [ ] Implement `evaldiff diff` with the API's comparison requirements. Define
+  and document stable exit codes: 0 for a passing evaluation/gate, 1 for a
+  failed evaluation/regression, and 2 for operational or usage errors.
+  Incomplete/failed runs and polling timeouts must never produce a green gate.
+- [ ] Include input, expected answer, actual output, and judge explanation in
+  authorized JSON/Markdown reports. Persist evidence across restarts, including
+  deployments without S3; bound report size and preserve account isolation.
+- [ ] Align README commands, authentication setup, threshold semantics, and
+  version output with the implementation. Clearly label npm's stub status.
+- [ ] Extend the forkable demo and action usage guide with a complete CLI
+  example: passing baseline, deliberate regression, failing gate, and report.
+
+Acceptance: execute the documented quickstart from a clean install. CLI tests
+cover passing and failing cases, authentication errors, rate limits, network
+failures, invalid comparisons, and polling deadlines. A developer can diagnose
+an intentional regression from the resulting report in five minutes.
+
+### F. Following features and maintenance
+
+- Named baselines with dataset, prompt, model, and commit provenance.
+- Repeated evaluations and score spread to distinguish regressions from noise.
+- JSON-schema, regex, required-field, and numeric-tolerance checks.
+- Validate the workflow with real users before building a larger dashboard.
+- Continue hardening from the private tracker; the plan above is a response to
+  this review, not an exhaustive security certification.
+
+### G. Previously completed product work (recorded history)
 
 - **Landing page:** evaldiff.io root live 2026-10-07.
 - **Forkable demo:** `evaldiff/example-repo` live with red/green gate verification
@@ -143,7 +230,7 @@ README so the workflow is discoverable.
 - API: https://api.evaldiff.io (159.69.47.127, Hetzner, deploy@ key-based)
 - Auth: header `Authorization: Bearer *** (eval_...)
 - Box: ~/evaldiff-deploy/docker-compose.yml, SeaweedFS S3 on :8333 (internal)
-- Tests: `.venv/bin/python -m pytest -q` (50 passing locally as of this update)
+- Tests: `.venv/bin/python -m pytest -q` (68 passed in the latest local run; PostgreSQL not verified)
 - Lint / format: `.venv/bin/ruff check .` and `.venv/bin/ruff format --check .`
 - Action: ~/evaldiff-action → repo evaldiff/action (token in .git/config)
 - Usage guide (final): /home/peter/evaldiff-guide-auto.md (send as base64!)
