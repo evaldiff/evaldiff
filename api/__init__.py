@@ -6,4 +6,4 @@ from importlib.metadata import version as _pkg_version
 try:  # stay in sync with the installed distribution
     __version__ = _pkg_version("evaldiff")
 except PackageNotFoundError:  # dev checkout without install
-    __version__ = "0.0.14"
+    __version__ = "0.0.15"

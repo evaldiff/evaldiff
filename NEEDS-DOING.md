@@ -253,3 +253,52 @@ persistence, quota reservation at enqueue (race-safe, 4×600 concurrent
 verified), failed-case billing, hashed API keys, SQLi-safe ORM layer,
 cross-tenant isolation. Remaining hardening details are tracked privately; the current release
 checklist and product priorities are in section 3.
+
+## Section A follow-up: P1/P2 review fixes — SHIPPED 0.0.15 (2026-10-10)
+
+Closes the three reviewer-found gaps from the 0.0.14 review:
+
+1. **P1 — decompression allocation bounded during decoding.**
+   `http_limits.read_capped_body` now decodes gzip/deflate through a windowed
+   incremental decoder (`decompress(data, max_out)`, 64 KiB window), so a
+   decompression bomb raises `ResponseLimitExceeded` at the cap instead of
+   allocating the full expansion. Also: `post_json_bounded` now checks the
+   `X-Evaldiff-Guard` marker on the response *headers before reading the
+   body*, so a proxy-violation 502 surfaces as the limit exception instead
+   of being read to the cap. Buffered (MockTransport) streams are handled
+   via `StreamConsumed` → `response.content` seeding, still under cap.
+
+2. **P1 — proxy observes client disconnect while buffering.**
+   `ssrf_guard._read_response` now takes the client socket, wakes on a
+   0.25 s tick, and raises `ClientDisconnected` (MSG_PEEK, no data eaten)
+   as soon as the client closes — instead of finishing the whole upstream
+   body first. A stalled upstream now hits the 30 s idle window instead of
+   the 120 s socket timeout. `_handle` releases both sockets on
+   `ClientDisconnected`.
+
+3. **P2 — proxy violation is not retried.**
+   Tagged 502s (`X-Evaldiff-Guard: ResponseTooLarge` / `UpstreamStalled`)
+   are translated to `ResponseLimitExceeded` / `ResponseStalled` (both
+   `OSError`, outside `_with_retries`' retry set), so the case is recorded
+   as a limit/stall failure, not charged, and not re-issued. Plain
+   untagged 502s keep the old retry behavior.
+
+**Also fixed (found while writing the tests):** `_read_response` was
+rewritten as a single state-machine reader over one buffer, fixing two real
+bugs the old code had: (a) a chunk size *declared over the cap* (e.g.
+`Content-Length: 1000` with cap 100) no longer waits for the body before
+rejecting — it rejects at the declaration; (b) a complete response landing
+exactly at the cap is now returned in full (previously rejected by the
+`len(out) >= cap` check). EOF is evaluated frame-aware: read-until-EOF
+bodies ending in EOF are complete by protocol; EOF mid-frame (chunked /
+content-length) means the server closed early and is rejected.
+
+**Tests:** `tests/test_section_a_followup.py` (new, 8 tests): decompression
+bomb capped without allocating expansion, gzip/deflate within cap decoded
+correctly, proxy size violation → limit (1 call, no retry), proxy stall →
+stalled (1 call, no retry), plain 502 still retried (2 calls), proxy
+releases upstream socket when client disappears (holder sees EOF, thread
+terminates), proxy upstream stall → tagged 502 within the idle window.
+
+**Shipped:** full suite 87 passed, ruff clean, `v0.0.15` pushed → CI →
+publish (PyPI + npm + Hetzner) — see 0.0.15 release notes for verification.

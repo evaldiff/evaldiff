@@ -155,7 +155,7 @@ def test_oversized_response_returns_502(monkeypatch):
     import api.ssrf_guard as guard
 
     original = guard._read_response
-    monkeypatch.setattr(guard, "_read_response", lambda sock: original(sock, cap=100))
+    monkeypatch.setattr(guard, "_read_response", lambda sock, **kw: original(sock, cap=100))
     client, proxy = socket.socketpair()
     upstream, server = socket.socketpair()
     try:
