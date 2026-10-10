@@ -2,7 +2,7 @@
 "use strict";
 
 // evaldiff — CI for LLM prompts. (v0.0.1: name reservation stub)
-const VERSION = "0.0.13";
+const VERSION = "0.0.14";
 
 const args = process.argv.slice(2);
 
