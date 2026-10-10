@@ -8,11 +8,12 @@ import ipaddress
 import json
 import math
 import time
+from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Any
 from urllib.parse import urlparse
 
-from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, status
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
@@ -142,8 +143,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or Settings()
     app = FastAPI(title="evaldiff API", version=__version__)
 
-    @app.on_event("startup")
-    def _startup() -> None:
+    @asynccontextmanager
+    async def _lifespan(_: FastAPI):
         import logging
 
         from sqlalchemy.orm import sessionmaker
@@ -172,18 +173,23 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "runs.api_key_ref are PLAINTEXT. Set it (Fernet key) before "
                 "serving real traffic."
             )
+        worker_task: asyncio.Task | None = None
         if settings.enable_worker:
             stop = asyncio.Event()
             app.state.worker_stop = stop
             app.state.worker_task = asyncio.create_task(worker_loop(stop, interval=1.0))
+            worker_task = app.state.worker_task
+        try:
+            yield
+        finally:
+            if worker_task is not None:
+                with contextlib.suppress(Exception):
+                    app.state.worker_stop.set()
+                    worker_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await worker_task
 
-    @app.on_event("shutdown")
-    async def _shutdown() -> None:
-        with contextlib.suppress(Exception):
-            app.state.worker_stop.set()
-            app.state.worker_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await app.state.worker_task
+    app.router.lifespan_context = _lifespan
 
     # ---------- meta ----------
     @app.get("/health")
@@ -352,10 +358,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/v1/runs", response_model=list[RunOut])
     def list_runs(
+        limit: int = Query(default=100, ge=1, le=1000, description="max runs to return"),
+        offset: int = Query(default=0, ge=0, description="runs to skip"),
         account: Account = Depends(get_current_account),
         session: Session = Depends(get_session),
     ) -> list[RunOut]:
-        rows = session.query(Run).filter(Run.account_id == account.id).order_by(Run.id.desc()).all()
+        rows = (
+            session.query(Run)
+            .filter(Run.account_id == account.id)
+            .order_by(Run.id.desc())
+            .offset(offset)
+            .limit(limit)
+            .all()
+        )
         return [_run_out(r) for r in rows]
 
     @app.get("/v1/runs/{run_id}", response_model=RunOut)

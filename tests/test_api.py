@@ -200,6 +200,63 @@ def test_dataset_validation(client) -> None:
     assert client.get(f"/v1/datasets/{ds['id']}", headers=headers).status_code == 200
 
 
+def test_run_list_pagination(client, echo_model) -> None:
+    """GET /v1/runs supports limit/offset (newest first)."""
+    key = client.post("/v1/auth/signup", json={"email": "page@example.com"}).json()["key"]
+    headers = {"Authorization": f"Bearer {key}"}
+    ds = client.post(
+        "/v1/datasets",
+        headers=headers,
+        json={"name": "d", "cases": [{"input": "hi", "expected": "hi"}]},
+    ).json()
+    ids = []
+    for _ in range(3):
+        r = client.post(
+            "/v1/runs",
+            headers=headers,
+            json={"dataset_id": ds["id"], "model": "m", "endpoint": echo_model},
+        )
+        assert r.status_code == 202, r.text
+        ids.append(r.json()["id"])
+    # all three, newest first
+    got = [x["id"] for x in client.get("/v1/runs", headers=headers).json()]
+    assert got == [max(ids), sorted(ids, reverse=True)[1], min(ids)]
+    # page of 2, then skip 2 -> only the oldest remains
+    assert [x["id"] for x in client.get("/v1/runs?limit=2", headers=headers).json()] == [
+        max(ids),
+        sorted(ids, reverse=True)[1],
+    ]
+    assert [x["id"] for x in client.get("/v1/runs?limit=2&offset=2", headers=headers).json()] == [
+        min(ids)
+    ]
+    # validation bounds
+    assert client.get("/v1/runs?limit=0", headers=headers).status_code == 422
+    assert client.get("/v1/runs?limit=5000", headers=headers).status_code == 422
+    assert client.get("/v1/runs?offset=-1", headers=headers).status_code == 422
+
+
+def test_lifespan_worker_stops(tmp_path) -> None:
+    """Lifespan (replacing on_event) still starts the worker and stops it cleanly."""
+    from starlette.testclient import TestClient
+
+    from api.main import create_app
+    from api.settings import Settings
+
+    app = create_app(
+        Settings(
+            database_url=f"sqlite:///{tmp_path}/life.db",
+            enable_worker=True,
+            rate_limit_rpm=0,
+            signup_rate_per_min=0,
+        )
+    )
+    with TestClient(app) as c:
+        assert c.get("/health").status_code == 200
+        assert getattr(app.state, "worker_task", None) is not None
+    # after the context exits the task must be done (cancelled), not leaked
+    assert app.state.worker_task.done()
+
+
 def test_full_run_lifecycle_and_diff(client, echo_model) -> None:
     key = client.post("/v1/auth/signup", json={"email": "e2e@example.com"}).json()["key"]
     headers = {"Authorization": f"Bearer {key}"}
