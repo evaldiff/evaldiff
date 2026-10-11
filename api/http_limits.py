@@ -28,6 +28,9 @@ bounded by ``len(out)`` + one window + one raw chunk — never by the
 expansion ratio. A decompression bomb raises ``ResponseLimitExceeded``
 once the window crosses the cap.
 
+Compressed responses must contain a single stream; trailing bytes and
+concatenated streams are rejected rather than silently ignored.
+
 Supported encodings: identity, gzip, deflate (zlib-wrapped or raw
 stream), and br (when the optional ``brotli`` package is installed and
 bounded); anything else is rejected with ``ResponseLimitExceeded`` — we
@@ -94,6 +97,20 @@ async def _aclose(response: httpx.Response) -> None:
         await response.aclose()
 
 
+def _decompress_single_stream(decoder: Any, data: bytes, max_out: int) -> bytes:
+    """Reject trailing input before zlib can accumulate it in unused_data.
+
+    Only one compressed stream is supported per response. Check both a
+    subsequent wire chunk and a suffix sharing the chunk that reaches EOF.
+    """
+    if decoder.eof and data:
+        raise ResponseLimitExceeded("response contains data after compression EOF")
+    out = decoder.decompress(data, max_out)
+    if decoder.unused_data:
+        raise ResponseLimitExceeded("response contains data after compression EOF")
+    return out
+
+
 class _ZlibDecoder:
     """A zlib-family stream (gzip or zlib-wrapped) with the uniform
     bounded-decoding protocol: ``decompress(data, max_out)`` + ``residual``
@@ -103,7 +120,7 @@ class _ZlibDecoder:
         self._d = zlib.decompressobj(wbits)
 
     def decompress(self, data: bytes, max_out: int) -> bytes:
-        return self._d.decompress(data, max_out)
+        return _decompress_single_stream(self._d, data, max_out)
 
     @property
     def residual(self) -> bytes:
@@ -160,14 +177,11 @@ class _RawDeflateDecoder:
         self._cap = cap
 
     def _detection_buffer(self) -> int:
-        """Largest wire size a *valid* body that decodes to <= ``cap`` bytes
-        can have, plus one decode window of in-flight input.
+        """Resource budget for wire bytes consumed during format detection.
 
-        Deflate's worst case is stored blocks: 5 bytes of overhead per
-        65535 of payload, plus the zlib header/ADLER (a constant). A body
-        whose wire size exceeds this cannot decode to <= ``cap`` without
-        being malformed, so it is rejected — this bounds the pre-settle
-        buffering while still accepting every legal body.
+        Allow the decoded cap plus ordinary stored-block overhead and a
+        window of slack. This is a policy limit, not a maximum legal wire
+        size: valid streams can contain arbitrarily many empty blocks.
         """
         base = self._cap if self._cap > 0 else self._WINDOW
         return base + (base // 65535 + 1) * 5 + self._WINDOW + 16
@@ -187,7 +201,7 @@ class _RawDeflateDecoder:
     def decompress(self, data: bytes, max_out: int) -> bytes:
         if self._committed:
             assert self._active is not None
-            return self._active.decompress(data, max_out)
+            return _decompress_single_stream(self._active, data, max_out)
         if not data:
             return b""
         self._wire_seen += len(data)
@@ -239,6 +253,8 @@ class _RawDeflateDecoder:
         caller has not yet emitted). Any ``unconsumed_tail`` the committed
         decoder still holds is drained by the residual loop in
         ``_accept_chunk`` — re-feeding it here would discard its output."""
+        if best.unused_data:
+            self._reject("response contains data after compression EOF")
         buf = self._z_buf if best is self._z else self._r_buf
         self._z_buf = self._r_buf = b""
         self._active = best

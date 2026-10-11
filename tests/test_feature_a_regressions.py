@@ -27,6 +27,7 @@ import json
 import zlib
 
 import httpx
+import pytest
 
 import api.http_limits as hl
 from api.db import state
@@ -269,11 +270,11 @@ def test_nonfinal_empty_blocks_rejected_at_detection_cap() -> None:
 
 
 def test_final_empty_blocks_accepted_with_zero_output() -> None:
-    """Converse: a *short* legal stream of empty stored blocks (each
+    """Converse: a *short* legal stream of empty stored blocks (only the last
     final, zero output) is a valid body and must be accepted — not
     rejected by the detection cap that bounds the non-final attack."""
     _set_limits(2048, 5.0)
-    wire = _empty_block(1) * 3  # 15 wire bytes, decodes to b""
+    wire = _empty_block(0) * 2 + _empty_block(1)  # one stream, zero output
 
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
@@ -336,3 +337,76 @@ def test_sustained_final_empty_blocks_rejected_at_detection_cap() -> None:
 
     with __import__("pytest").raises(hl.ResponseLimitExceeded):
         _post(handler)
+
+
+@pytest.mark.parametrize("encoding", ["gzip", "zlib", "raw"])
+@pytest.mark.parametrize("same_chunk", [False, True])
+@pytest.mark.parametrize("suffix_kind", ["garbage", "second_stream"])
+def test_trailing_compressed_data_rejected_and_closed(encoding, same_chunk, suffix_kind):
+    """Stop on trailing data, including a suffix in the final wire chunk.
+
+    Do not consume the rest of an endless body, retry, or leave its stream
+    open. Exercise both format detection and already-committed decoding.
+    """
+    from api.runner import _with_retries
+
+    _set_limits(2048, 5.0)
+
+    def compress(payload):
+        if encoding == "gzip":
+            return gzip.compress(payload)
+        co = zlib.compressobj(wbits=15 if encoding == "zlib" else -15)
+        return co.compress(payload) + co.flush()
+
+    wire = compress(b'{"ok":true}')
+    suffix = b"x" * 65536 if suffix_kind == "garbage" else compress(b" ")
+    chunks = [wire + suffix] if same_chunk else [wire, suffix]
+    calls = 0
+
+    class TrailingStream(httpx.AsyncByteStream):
+        closed = False
+
+        async def __aiter__(self):
+            for chunk in chunks:
+                yield chunk
+            pytest.fail("reader continued consuming data after compression EOF")
+
+        async def aclose(self):
+            self.closed = True
+
+    stream = TrailingStream()
+
+    def handler(request):
+        nonlocal calls
+        calls += 1
+        return httpx.Response(
+            200,
+            stream=stream,
+            headers={"Content-Encoding": "gzip" if encoding == "gzip" else "deflate"},
+        )
+
+    async def go():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            with pytest.raises(hl.ResponseLimitExceeded, match="after compression EOF"):
+                await _with_retries(
+                    hl.post_json_bounded,
+                    client,
+                    "https://model.example/x",
+                    body={},
+                    headers={},
+                    timeout=5.0,
+                    base_delay=0,
+                )
+
+    asyncio.run(go())
+    assert calls == 1
+    assert stream.closed
+
+
+def test_repeated_final_empty_blocks_rejected():
+    """A final empty block ends the stream; further blocks are trailing data."""
+    decoder = hl._RawDeflateDecoder(2048)
+    assert decoder.decompress(_empty_block(1), 65536) == b""
+    with pytest.raises(hl.ResponseLimitExceeded, match="after compression EOF"):
+        decoder.decompress(_empty_block(1) * 100, 65536)
+    assert decoder._active.unused_data == b""
