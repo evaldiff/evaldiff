@@ -89,7 +89,7 @@ async def _execute_cases(run: Run, session: Session, cases: list, protect, attem
     try:
         # Decrypt the model key once per run (Fernet at rest, plaintext in
         # memory only for the duration of this run).
-        api_key = decrypt_api_key(run.api_key_ref)
+        api_key = decrypt_api_key(run.api_key_ref, settings=state.settings)
         async with httpx.AsyncClient(proxy=guard.proxy_url) as client:
             for seq, c in enumerate(cases):
                 row = RunCase(run_id=run.id, seq=seq)

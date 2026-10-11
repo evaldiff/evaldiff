@@ -83,7 +83,7 @@ class Run(Base):
     )
     model: Mapped[str] = mapped_column(String(200))
     endpoint: Mapped[str] = mapped_column(String(512))
-    api_key_ref: Mapped[str] = mapped_column(String(512), default="")
+    api_key_ref: Mapped[str] = mapped_column(Text, default="")
     prompt_template: Mapped[str] = mapped_column(Text, default="{{ input }}")
     threshold: Mapped[float] = mapped_column(Float, default=0.8)
     status: Mapped[str] = mapped_column(String(20), default="queued")  # queued|running|done|failed

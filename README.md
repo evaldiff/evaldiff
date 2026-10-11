@@ -105,3 +105,15 @@ Groq, Together, Ollama, vLLM, LM Studio. Everything else: bring your own adapter
 - `0.0.2` — API core: auth, datasets, runs (worker + retries), judges, diff + report
 - Next: GitHub Action (`@evaldiff/action`), web diff view, usage-based billing
 
+
+## Production credentials
+
+Local development defaults to plaintext model-credential storage unless
+`EVALDIFF_SECRET_KEY` is configured. Set `EVALDIFF_PRODUCTION=true` in production;
+startup then requires a valid Fernet key and encrypted, readable stored
+credentials. The bundled Compose deployment enforces this mode.
+
+Follow [the upgrade guide](deploy/UPGRADING.md#production-credential-encryption-part-b)
+for key provisioning, the offline `python -m api.migrate_secrets` command,
+backup restoration, and rotation. The deployment image builds the checked-out
+source; use the full repository checkout when deploying.

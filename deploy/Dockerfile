@@ -2,9 +2,12 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
-# evaldiff 0.0.16 from PyPI (API + CLI in one package)
-# + drivers: psycopg (Postgres), boto3 (S3/SeaweedFS)
-RUN pip install --no-cache-dir evaldiff==0.0.16 "psycopg[binary]>=3.1" boto3
+# Build the checked-out candidate, including its migration command. Copy only
+# package inputs, never deployment .env files, databases, or repository metadata.
+COPY pyproject.toml README.md LICENSE ./
+COPY api ./api
+COPY evaldiff_cli ./evaldiff_cli
+RUN pip install --no-cache-dir . "psycopg[binary]>=3.1" boto3
 
 # non-root
 RUN useradd -m appuser

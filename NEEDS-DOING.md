@@ -1,4 +1,4 @@
-# evaldiff — NEEDS-DOING (updated 2026-10-10)
+# evaldiff — NEEDS-DOING (updated 2026-10-11)
 
 ## 0. Current status
 
@@ -147,27 +147,44 @@ full-stack run where an over-cap case records an error, the run finishes, and a
 subsequent queued run completes. 11 tests; 79/79 suite green; CI green
 (85b9db6). Live: PyPI 0.0.14, api.evaldiff.io `/health` → 0.0.14, npm staged.
 
-### B. Require encryption in production deployments
+### B. Require encryption in production deployments — implemented locally (not released)
 
-Files: `api/secrets.py`, `api/settings.py`, `api/main.py`,
-`deploy/docker-compose.yml`, `deploy/deploy.sh`, `deploy/UPGRADING.md`.
+Files: `api/secrets.py`, `api/settings.py`, `api/main.py`, `api/models.py`,
+`api/migrate_secrets.py`, `deploy/`, `tests/test_production_secrets.py`.
 
-- [ ] Add an explicit production configuration that refuses startup when
+- [x] Add an explicit production configuration that refuses startup when
   `EVALDIFF_SECRET_KEY` is missing or invalid. Preserve documented local
   development behavior without silently allowing plaintext in production.
-- [ ] Pass the key into the API container and validate required configuration
+- [x] Pass the key into the API container and validate required configuration
   before deployment. Document generating and securely provisioning a stable
   key; never commit it or include it in logs.
-- [ ] Provide an idempotent migration for existing plaintext model keys, with
+- [x] Provide an idempotent migration for existing plaintext model keys, with
   backup and rollback instructions. Check encrypted values fit the database
   column, including longer provider keys.
-- [ ] Document key backup, restoration, and rotation. Rotation must retain
+- [x] Document key backup, restoration, and rotation. Rotation must retain
   access to previously encrypted values until migration is complete.
 
 Acceptance: production startup fails for missing/invalid keys; new and migrated
 rows contain ciphertext; queued runs still execute after restart. Restore a
 backup with its matching key and verify decryption. Test wrong-key handling
 without exposing secrets.
+
+Implementation: `EVALDIFF_PRODUCTION=true` requires a valid key and checks
+stored credentials before serving or starting workers. Production refuses
+plaintext/unreadable rows. The offline `python -m api.migrate_secrets` command
+atomically encrypts legacy rows and widens PostgreSQL credentials to `TEXT`;
+`--rotate` re-encrypts under the primary while `EVALDIFF_PREVIOUS_SECRET_KEYS`
+retains read access until primary-only verification succeeds. New deployments
+build the reviewed source checkout rather than the old PyPI pin.
+
+Local validation covers missing/invalid/wrong keys, long credentials,
+idempotency, atomic rollback, rotation, deployment preflight redaction, and
+SQLite backup restoration followed by queued-run execution. Migration and
+recovery tests also pass against disposable PostgreSQL 16.2 / psycopg 3.3.6.
+Final local run: **142 tests passed** with `EVALDIFF_TEST_POSTGRES_URL` set;
+ruff lint/format, ShellCheck, whitespace checks, and wheel build passed.
+Production rollout, Docker image execution, and live backup/restore rehearsal
+remain deployment work; no production data has been migrated by this change.
 
 ### C. Bound run duration and prevent queue starvation
 
@@ -222,9 +239,10 @@ Depends on A–C for final release qualification.
 - [ ] Run a load/soak test with mixed accounts, large datasets, slow/failing
   endpoints, and worker restarts. Agree on queue-wait, API-latency, and memory
   limits before the test; record whether the candidate meets them.
-- [ ] Publish the tested version and update the Dockerfile pin (it installs a
-  PyPI release, not the local checkout). Follow the upgrade instructions,
-  verify the deployed version, and document a tested rollback procedure.
+- [ ] Publish the tested version and build the deployment image from that exact
+  reviewed checkout (the Dockerfile now installs local source). Follow the
+  upgrade instructions, verify the deployed version and revision, and document
+  a tested rollback procedure.
 
 Acceptance: all required CI checks and staging scenarios pass, resource usage
 stays within the agreed budget, and restore/recovery drills succeed. Attach

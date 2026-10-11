@@ -21,11 +21,12 @@ from . import __version__
 from .auth import create_key, get_current_account
 from .db import Base, get_session, make_engine, state
 from .diff import compute_diff, diff_to_markdown, run_to_markdown
+from .migrate_secrets import verify_credentials
 from .models import Account, Dataset, Run
 from .quota import ledger_metadata, migrate_legacy_usage, now_period, used_cases_for
 from .quota import reserve as reserve_quota
 from .ratelimit import RateLimiter
-from .secrets import encrypt_api_key, has_secret_key
+from .secrets import KeyCipher, encrypt_api_key
 from .settings import Settings
 from .storage import build_storage
 from .worker import enqueue_run, worker_loop
@@ -149,37 +150,39 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
         from sqlalchemy.orm import sessionmaker
 
-        state.settings = settings
-        state.storage = build_storage(settings)
-        state.limiter = (
-            RateLimiter(
-                rpm=settings.rate_limit_rpm,
-                burst=settings.rate_limit_burst,
-                signup_per_min=settings.signup_rate_per_min,
-                signup_burst=settings.signup_burst,
-            )
-            if settings.rate_limit_rpm > 0 and settings.signup_rate_per_min > 0
-            else None
-        )
+        # Validate before creating storage, touching the database, or starting workers.
+        cipher = KeyCipher(settings)
         engine = make_engine(settings.database_url)
-        state.session_factory = sessionmaker(bind=engine)
-        Base.metadata.create_all(engine)
-        ledger_metadata().create_all(engine)  # run_reservations (quota ledger)
-        with state.session_factory() as session:
-            migrate_legacy_usage(session)
-        if not has_secret_key():
-            logging.getLogger("evaldiff").warning(
-                "EVALDIFF_SECRET_KEY is not set — model API keys stored in "
-                "runs.api_key_ref are PLAINTEXT. Set it (Fernet key) before "
-                "serving real traffic."
-            )
         worker_task: asyncio.Task | None = None
-        if settings.enable_worker:
-            stop = asyncio.Event()
-            app.state.worker_stop = stop
-            app.state.worker_task = asyncio.create_task(worker_loop(stop, interval=1.0))
-            worker_task = app.state.worker_task
         try:
+            Base.metadata.create_all(engine)
+            ledger_metadata().create_all(engine)
+            verify_credentials(engine, cipher, require_encrypted=settings.production)
+            state.settings = settings
+            state.session_factory = sessionmaker(bind=engine)
+            state.storage = build_storage(settings)
+            state.limiter = (
+                RateLimiter(
+                    rpm=settings.rate_limit_rpm,
+                    burst=settings.rate_limit_burst,
+                    signup_per_min=settings.signup_rate_per_min,
+                    signup_burst=settings.signup_burst,
+                )
+                if settings.rate_limit_rpm > 0 and settings.signup_rate_per_min > 0
+                else None
+            )
+            with state.session_factory() as session:
+                migrate_legacy_usage(session)
+            if cipher.primary is None:
+                logging.getLogger("evaldiff").warning(
+                    "Development mode: EVALDIFF_SECRET_KEY is not set; model credentials "
+                    "are stored in plaintext. Production requires encryption."
+                )
+            if settings.enable_worker:
+                stop = asyncio.Event()
+                app.state.worker_stop = stop
+                app.state.worker_task = asyncio.create_task(worker_loop(stop, interval=1.0))
+                worker_task = app.state.worker_task
             yield
         finally:
             if worker_task is not None:
@@ -188,6 +191,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     worker_task.cancel()
                     with contextlib.suppress(asyncio.CancelledError):
                         await worker_task
+            engine.dispose()
 
     app.router.lifespan_context = _lifespan
 
@@ -326,10 +330,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             dataset_id=ds.id,
             model=body.model,
             endpoint=body.endpoint,
-            # Encrypted at rest when EVALDIFF_SECRET_KEY is configured
-            # (legacy deployments without it store plaintext — loud warning
-            # at startup). The runner decrypts per run.
-            api_key_ref=encrypt_api_key(body.api_key),
+            # Settings are captured at startup; changing the process environment
+            # mid-run cannot silently disable production encryption.
+            api_key_ref=encrypt_api_key(body.api_key, settings=settings),
             prompt_template=body.prompt_template,
             threshold=body.threshold,
             status="queued",

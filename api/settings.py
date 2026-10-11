@@ -2,11 +2,18 @@
 
 from __future__ import annotations
 
+from pydantic import SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_prefix="EVALDIFF_")
+    model_config = SettingsConfigDict(env_prefix="EVALDIFF_", hide_input_in_errors=True)
+
+    # Local development remains zero-config; deployed Compose always enables this.
+    production: bool = False
+    secret_key: SecretStr | None = None
+    # Comma-separated prior Fernet keys, used only for reads during rotation.
+    previous_secret_keys: SecretStr | None = None
 
     database_url: str = "sqlite:///./evaldiff.db"
 

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 import socket
 
 import pytest
@@ -56,41 +55,30 @@ def test_fernet_encrypted_but_no_key_in_env(monkeypatch) -> None:
         decrypt_api_key(stored)
 
 
-def test_api_key_encrypted_at_rest(client, tmp_path) -> None:
-    """End-to-end: a run submitted with a model key stores enc:v1:<...>."""
-    import sqlite3
+def test_api_key_encrypted_at_rest(tmp_path, monkeypatch) -> None:
+    """Provision the encryption key before startup, as in production."""
+    from starlette.testclient import TestClient
 
-    import api.secrets as sekm
+    from api.db import state
+    from api.main import create_app
+    from api.models import Run
+    from api.secrets import generate_secret_key
+    from api.settings import Settings
+    from tests.test_production_secrets import submit
 
-    os.environ["EVALDIFF_SECRET_KEY"] = sekm.generate_secret_key()
-    try:
-        key = client.post("/v1/auth/signup", json={"email": "enc@example.com"}).json()["key"]
-        H = {"Authorization": f"Bearer {key}"}
-        ds = client.post(
-            "/v1/datasets",
-            headers=H,
-            json={"name": "d", "cases": [{"input": "i", "expected": "e"}]},
-        ).json()
-        r = client.post(
-            "/v1/runs",
-            headers=H,
-            json={
-                "dataset_id": ds["id"],
-                "model": "m",
-                "endpoint": "http://127.0.0.1:9/v1",  # never reached: fails at dial time
-                "api_key": "sk-VISIBLE-PLAINTEXT",
-            },
-        )
-        assert r.status_code == 202
-        row = (
-            sqlite3.connect(f"{tmp_path}/test.db")
-            .execute("select api_key_ref from runs order by id desc limit 1")
-            .fetchone()
-        )
-        assert row[0].startswith("enc:v1:")
-        assert "sk-VISIBLE-PLAINTEXT" not in row[0]
-    finally:
-        del os.environ["EVALDIFF_SECRET_KEY"]
+    monkeypatch.setenv("EVALDIFF_SECRET_KEY", generate_secret_key())
+    settings = Settings(
+        database_url=f"sqlite:///{tmp_path}/test.db",
+        enable_worker=False,
+        rate_limit_rpm=0,
+        signup_rate_per_min=0,
+    )
+    with TestClient(create_app(settings)) as client:
+        _, run_id = submit(client, "sk-VISIBLE-PLAINTEXT")
+        with state.session_factory() as session:
+            stored = session.get(Run, run_id).api_key_ref
+        assert stored.startswith("enc:v1:")
+        assert "sk-VISIBLE-PLAINTEXT" not in stored
 
 
 # ---------- SSRF guard: dial-time validation (DNS rebinding window) ----------

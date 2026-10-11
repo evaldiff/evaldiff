@@ -13,7 +13,7 @@ class Base(DeclarativeBase):
 
 
 def make_engine(url: str):
-    kwargs: dict = {}
+    kwargs: dict = {"hide_parameters": True}
     if url.startswith("sqlite"):
         # SQLite serializes writes; quota reservations explicitly acquire
         # the write lock before checking usage. SERIALIZABLE alone does
