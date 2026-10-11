@@ -9,3 +9,14 @@ api.evaldiff.io {
 		-Server
 	}
 }
+
+evaldiff.io {
+	root * /srv/site
+	file_server
+	encode zstd gzip
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options nosniff
+		-Server
+	}
+}

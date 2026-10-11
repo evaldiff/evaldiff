@@ -1,0 +1,244 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>evaldiff — CI for LLM prompts</title>
+<meta name="description" content="evaldiff scores your LLM output against a dataset and gates your CI with a green/red checkmark. The npm test of prompts.">
+<style>
+  :root {
+    --bg: #0b0e11;
+    --panel: #11151a;
+    --line: #232a33;
+    --ink: #e8edf2;
+    --muted: #8b98a5;
+    --pass: #34d384;
+    --fail: #f2555a;
+    --accent: #5eead4;
+    --mono: ui-monospace, "SF Mono", "Cascadia Code", Menlo, Consolas, monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font-family: var(--sans); line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 1080px; margin: 0 auto; padding: 0 24px; }
+
+  /* ---------- header ---------- */
+  header { border-bottom: 1px solid var(--line); }
+  .bar { display: flex; align-items: center; justify-content: space-between; height: 60px; }
+  .mark { font-family: var(--mono); font-size: 17px; letter-spacing: -0.02em; color: var(--ink); text-decoration: none; }
+  .mark b { color: var(--pass); font-weight: 600; }
+  nav a { color: var(--muted); text-decoration: none; margin-left: 22px; font-size: 14px; }
+  nav a:hover { color: var(--ink); }
+
+  /* ---------- hero ---------- */
+  .hero { padding: 96px 0 72px; }
+  .kicker { font-family: var(--mono); font-size: 13px; color: var(--accent); letter-spacing: 0.06em; margin: 0 0 18px; }
+  h1 {
+    font-size: clamp(34px, 5.4vw, 58px); line-height: 1.08; letter-spacing: -0.03em;
+    font-weight: 700; margin: 0 0 22px; max-width: 15ch; text-wrap: balance;
+  }
+  h1 .dim { color: var(--muted); font-weight: 500; }
+  .sub { font-size: 18px; color: var(--muted); max-width: 52ch; margin: 0 0 34px; text-wrap: pretty; }
+  .ctas { display: flex; gap: 14px; flex-wrap: wrap; margin-bottom: 46px; }
+  .btn {
+    font-size: 14px; font-weight: 600; text-decoration: none; border-radius: 8px;
+    padding: 12px 20px; min-height: 44px; display: inline-flex; align-items: center; gap: 8px;
+  }
+  .btn-primary { background: var(--ink); color: #0b0e11; }
+  .btn-primary:hover { background: #fff; }
+  .btn-ghost { border: 1px solid var(--line); color: var(--ink); }
+  .btn-ghost:hover { border-color: var(--muted); }
+  .btn .mono { font-family: var(--mono); font-size: 13px; opacity: 0.75; }
+
+  /* ---------- terminal ---------- */
+  .term {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
+    overflow: hidden; margin: 0;
+  }
+  .term-bar {
+    display: flex; align-items: center; gap: 7px; padding: 11px 14px;
+    border-bottom: 1px solid var(--line); background: rgba(255,255,255,0.02);
+  }
+  .dot { width: 11px; height: 11px; border-radius: 50%; background: #2a323c; }
+  .term-title { font-family: var(--mono); font-size: 12px; color: var(--muted); margin-left: 8px; }
+  pre {
+    margin: 0; padding: 18px 20px; overflow-x: auto;
+    font-family: var(--mono); font-size: 13.5px; line-height: 1.75;
+  }
+  .c-prompt { color: #4b5866; }
+  .c-cmd { color: var(--ink); }
+  .c-comment { color: #4b5866; }
+  .c-flag { color: var(--accent); }
+  .c-pass { color: var(--pass); font-weight: 600; }
+  .c-fail { color: var(--fail); font-weight: 600; }
+  .c-dim { color: var(--muted); }
+
+  /* ---------- sections ---------- */
+  section { padding: 64px 0; border-top: 1px solid var(--line); }
+  h2 { font-size: 28px; letter-spacing: -0.02em; margin: 0 0 14px; font-weight: 700; }
+  .lede { color: var(--muted); max-width: 58ch; margin: 0 0 40px; }
+
+  /* steps: numbered flow, not cards */
+  .steps { counter-reset: step; display: grid; gap: 28px; }
+  .step { display: grid; grid-template-columns: 56px 1fr; gap: 20px; align-items: start; }
+  .step-n {
+    counter-increment: step; width: 44px; height: 44px; border: 1px solid var(--line);
+    border-radius: 50%; display: flex; align-items: center; justify-content: center;
+    font-family: var(--mono); font-size: 15px; color: var(--accent);
+  }
+  .step-n::before { content: counter(step); }
+  .step h3 { margin: 0 0 6px; font-size: 17px; }
+  .step p { margin: 0 0 12px; color: var(--muted); font-size: 15px; }
+  .step .term { margin: 0; }
+
+  /* gate comparison */
+  .gates { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+  @media (max-width: 760px) { .gates { grid-template-columns: 1fr; } }
+  .gate .term-bar { border-radius: 12px 12px 0 0; }
+  .gate pre { border-radius: 0 0 12px 12px; }
+  .badge {
+    font-family: var(--mono); font-size: 11px; letter-spacing: 0.08em;
+    padding: 3px 9px; border-radius: 999px; margin-left: auto;
+  }
+  .badge-pass { background: rgba(52,211,132,0.12); color: var(--pass); }
+  .badge-fail { background: rgba(242,85,90,0.12); color: var(--fail); }
+
+  /* install */
+  .install pre { font-size: 14px; }
+
+  footer { border-top: 1px solid var(--line); padding: 36px 0 56px; color: var(--muted); font-size: 14px; }
+  footer a { color: var(--ink); text-decoration: none; border-bottom: 1px solid var(--line); }
+  footer a:hover { border-color: var(--muted); }
+  footer .fbar { display: flex; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
+
+  @media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="wrap bar">
+    <a class="mark" href="#">eval<b>diff</b></a>
+    <nav>
+      <a href="https://github.com/evaldiff/evaldiff">GitHub</a>
+      <a href="https://github.com/evaldiff/example-repo">Example</a>
+      <a href="https://api.evaldiff.io/health" target="_blank" rel="noopener">Status</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap">
+
+  <section class="hero" style="border-top:0; padding-top:96px;">
+    <p class="kicker">CI FOR LLM PROMPTS</p>
+    <h1>Your model regressed.<br><span class="dim">Your CI should have caught it.</span></h1>
+    <p class="sub">evaldiff scores your LLM output against a dataset of expected answers
+      and gates your pipeline with a green/red checkmark — the <code>npm test</code> of prompts.</p>
+    <div class="ctas">
+      <a class="btn btn-primary" href="https://github.com/evaldiff/example-repo">Try the example repo <span class="mono">→</span></a>
+      <a class="btn btn-ghost" href="https://github.com/evaldiff/evaldiff#readme">Read the docs</a>
+    </div>
+
+    <div class="term">
+      <div class="term-bar"><span class="dot"></span><span class="dot"></span><span class="dot"></span><span class="term-title">GitHub Actions — main</span></div>
+      <pre><span class="c-dim">2026-10-07T18:21:14Z</span>  <span class="c-dim">run 43: done passed=1/3</span>
+<span class="c-dim">2026-10-07T18:21:14Z</span>  <span class="c-dim">| passed | 1 |</span>
+<span class="c-fail">##[error]GATE FAIL: pass_rate=33.33% (threshold 80%)</span>
+<span class="c-dim">2026-10-07T18:21:14Z</span>  <span class="c-dim">Process completed with exit code 5.</span></pre>
+    </div>
+  </section>
+
+  <section id="how">
+    <h2>Three files. One gate.</h2>
+    <p class="lede">No agents, no dashboards you have to babysit. A dataset, a run, a threshold.</p>
+    <div class="steps">
+      <div class="step">
+        <div class="step-n"></div>
+        <div>
+          <h3>Write cases</h3>
+          <p>Plain JSON. What the model should do, and what counts as correct.</p>
+          <div class="term">
+            <pre>[
+  { <span class="c-flag">"input"</span>: <span class="c-cmd">"What is the capital of France?"</span>,
+    <span class="c-flag">"expected"</span>: <span class="c-cmd">"Paris"</span> },
+  { <span class="c-flag">"input"</span>: <span class="c-cmd">"Reply with exactly one word: PONG"</span>,
+    <span class="c-flag">"expected"</span>: <span class="c-cmd">"PONG"</span> }
+]</pre>
+          </div>
+        </div>
+      </div>
+      <div class="step">
+        <div class="step-n"></div>
+        <div>
+          <h3>Score any model</h3>
+          <p>OpenAI, self-hosted, Ollama, vLLM — anything with an OpenAI-compatible endpoint. Runs are per-case scored, with latency and tokens.</p>
+          <div class="term">
+            <pre><span class="c-prompt">$</span> <span class="c-cmd">pip install evaldiff</span>
+<span class="c-prompt">$</span> <span class="c-cmd">evaldiff run</span> <span class="c-flag">--dataset</span> evals/cases.json \
+    <span class="c-flag">--endpoint</span> https://your-model/v1 \
+    <span class="c-flag">--model</span> qwen3.8:27b <span class="c-flag">--threshold</span> 0.8</pre>
+          </div>
+        </div>
+      </div>
+      <div class="step">
+        <div class="step-n"></div>
+        <div>
+          <h3>Gate the merge</h3>
+          <p>One line in your workflow. Exit code 0 or 1, drop it anywhere CI runs.</p>
+          <div class="term">
+            <pre><span class="c-flag">- name:</span> Run the evaldiff gate
+<span class="c-flag">  uses:</span> evaldiff/action@v2
+<span class="c-flag">  with:</span>
+    <span class="c-flag">api_key:</span> ${{ secrets.EVALDIFF_API_KEY }}
+    <span class="c-flag">dataset_json:</span> evals/cases.json
+    <span class="c-flag">threshold:</span> 0.8</pre>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section id="gates">
+    <h2>Green ships. Red blocks.</h2>
+    <p class="lede">Both below are real runs against a real model. That's the whole product surface:
+      a pass rate, a threshold, an exit code.</p>
+    <div class="gates">
+      <div class="gate">
+        <div class="term"><div class="term-bar"><span class="term-title">main @ fix: capital of France is Paris</span><span class="badge badge-pass">PASS</span></div></div>
+        <div class="term" style="border-top:0;"><pre><span class="c-dim">| pass rate | 100% |</span>
+<span class="c-pass">GATE PASS: pass_rate=100% (threshold 80%)</span></pre></div>
+      </div>
+      <div class="gate">
+        <div class="term"><div class="term-bar"><span class="term-title">main @ break: wrong expected</span><span class="badge badge-fail">FAIL</span></div></div>
+        <div class="term" style="border-top:0;"><pre><span class="c-dim">| pass rate | 33.33% |</span>
+<span class="c-fail">GATE FAIL: pass_rate=33.33% (threshold 80%)</span></pre></div>
+      </div>
+    </div>
+  </section>
+
+  <section id="install" class="install">
+    <h2>Install</h2>
+    <p class="lede">Python CLI today; GitHub Action ready. Diff any two runs to see exactly which cases regressed.</p>
+    <div class="term">
+      <pre><span class="c-prompt">$</span> <span class="c-cmd">pip install evaldiff</span>
+<span class="c-prompt">$</span> <span class="c-cmd">npm i -g @evaldiff/evaldiff</span>
+<span class="c-prompt">$</span> <span class="c-cmd">evaldiff diff &lt;run-a&gt; &lt;run-b&gt;</span>  <span class="c-comment"># regressions, side by side</span></pre>
+    </div>
+  </section>
+
+</div>
+
+<footer>
+  <div class="wrap fbar">
+    <div>evaldiff — CI for LLM prompts. Built by <a href="https://obald.se">Peter Hedman</a>.</div>
+    <div><a href="https://github.com/evaldiff/evaldiff">GitHub</a> · <a href="https://github.com/evaldiff/example-repo">Example repo</a> · <a href="https://github.com/evaldiff/action">Action</a></div>
+  </div>
+</footer>
+
+</body>
+</html>
