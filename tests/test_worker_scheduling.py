@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import threading
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -465,8 +466,120 @@ def test_backlog_account_cannot_monopolize_slots(sessions):
     # are skipped and slot 2 goes to B. A plain id-order claim (the old
     # behavior) would have given A all four slots — monopolization.
     assert claimed_run_ids[0] == rid_a1
-    assert rid_b1 in claimed_run_ids[1:]
+    with sessions() as session:
+        # A's first attempt is running (the cap counts running jobs).
+        session.execute(update(Run).where(Run.id == rid_a1).values(status="running"))
+        session.commit()
+    for _ in range(3):
+        with sessions() as session:
+            jid = asyncio.run(poll_once(session, max_active_per_account=1))
+            if not jid:
+                break
+            run_id = json.loads(session.get(Job, jid).payload_json)["run_id"]
+            claimed_run_ids.append(run_id)
+    assert rid_b1 in claimed_run_ids[1:], (
+        f"smaller account starved behind the capped backlog: {claimed_run_ids}"
+    )
     assert sum(1 for r in claimed_run_ids if r in rid_a_list) == 1  # A got 1 slot
     with sessions() as session:
         # A's remaining backlog stays pending (drained after A1 finishes).
         assert session.query(Job).filter(Job.status == "pending").count() == 3
+
+
+def test_deadline_covers_storage_write(sessions, monkeypatch):
+    """P1: the deadline covers the case's result write to storage, not
+    just the model call. A storage backend that finishes AFTER the
+    deadline must not charge the case or mark the run done — and the
+    write runs off the event loop, so it cannot stall lease heartbeats
+    while it blocks."""
+    aid, rid = seed(sessions, count=1, deadline=2)
+
+    class SlowStorage(InMemoryStorage):
+        started = threading.Event()
+
+        def put_json(self, key: str, obj: object) -> str:
+            self.started.set()
+            # Hold the write until well past the 2s deadline (then finish,
+            # like a slow backend that completes late).
+            time.sleep(3)
+            return super().put_json(key, obj)
+
+    slow = SlowStorage()
+    monkeypatch.setattr(state, "storage", slow)
+    monkeypatch.setattr("api.runner.call_model", fake_model(sessions))
+    jid, token = claim(sessions, rid)
+    started_at = time.monotonic()
+    asyncio.run(asyncio.wait_for(execute_run(rid, job_id=jid, lease_token=token), timeout=15))
+    elapsed = time.monotonic() - started_at
+    with sessions() as session:
+        run = session.get(Run, rid)
+        assert run.status == "failed"  # NOT done — the late storage write counts for nothing
+        assert "deadline" in (run.error or "").lower()
+        assert session.query(RunCase).count() == 0  # case not charged
+        assert used_cases_for(aid, now_period(), session) == 0  # full refund
+    assert SlowStorage.started.is_set()  # the storage write was actually entered
+    # The run failed AFTER the (slow) write landed — the late write counts
+    # for nothing: the case is not charged and the run is not marked done.
+    assert elapsed >= 2.8, f"storage write was not awaited to completion (elapsed={elapsed:.2f}s)"
+
+
+@pytest.mark.skipif(not os.environ.get("EVALDIFF_TEST_POSTGRES_URL"), reason="requires PostgreSQL")
+def test_account_cap_atomic_across_workers(sessions):
+    """P2: the per-account cap must be atomic across concurrent workers.
+    Two workers claiming the SAME account's two pending jobs at the SAME
+    instant, cap 1: at most ONE may win (the old snapshot-then-claim race
+    let both pass the check and both claim, leaving two running jobs for
+    a cap of one)."""
+    with sessions() as session:
+        if session.bind.dialect.name != "postgresql":
+            pytest.skip("FOR NO KEY UPDATE row locking requires PostgreSQL")
+    aid, run_ids = seed_backlog(sessions, n=2, count=1)
+    with sessions() as session:
+        # Preconditions: both jobs pending, nothing running yet.
+        jobs = session.query(Job).all()
+        assert len(jobs) == 2
+        for j in jobs:
+            assert j.status == "pending"
+        assert (
+            session.query(Run.id).filter(Run.account_id == aid, Run.status == "running").count()
+            == 0
+        )
+        # Both seeded runs belong to the same account (the race's subject).
+        for rid in run_ids:
+            assert session.get(Run, rid).account_id == aid
+
+    import threading
+
+    barrier = threading.Barrier(2, timeout=10)
+    results: list[int] = []
+    result_lock = threading.Lock()
+
+    def worker():
+        with sessions() as session:
+            barrier.wait()
+            r = asyncio.run(poll_once(session, max_active_per_account=1))
+        with result_lock:
+            results.append(r)
+
+    threads = [threading.Thread(target=worker) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=15)
+    assert len(results) == 2, "one or both workers did not complete"
+
+    with sessions() as session:
+        winners = [r for r in results if r]
+        assert len(winners) == 1, (
+            f"cap of 1 broken by the claim race: {len(winners)} workers claimed "
+            f"for the same account (results={results})"
+        )
+        running = (
+            session.query(Run.id).filter(Run.account_id == aid, Run.status == "running").count()
+        )
+        assert running == 0  # the claim flips the JOB, not the run — exactly one slot held
+        running_jobs = session.query(Job).filter(Job.status == "running").count()
+        assert running_jobs == 1
+        pending = session.query(Job).filter(Job.status == "pending").count()
+        assert pending == 1  # the other job is still queued, not lost
+        assert used_cases_for(aid, now_period(), session) == 2  # both reservations intact

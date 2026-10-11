@@ -9,12 +9,12 @@ import logging
 from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
-from sqlalchemy import update
+from sqlalchemy import text, update
 
 from .db import state
 from .leases import HEARTBEAT_SECONDS, LEASE_SECONDS, JobLease, LeaseLost, fence
 from .models import Job, Run
-from .quota import cleanup_for_reclaim, settle_run
+from .quota import cleanup_for_reclaim, lock_account, settle_run
 from .runner import execute_run
 
 _MAX_JOB_ATTEMPTS = 2
@@ -113,10 +113,22 @@ async def poll_once(session, *, max_active_per_account: int | None = None) -> in
 
     Fairness (NEEDS-DOING C): a pending job is SKIPPED (left pending,
     attempts not incremented) when its account already has
-    ``max_active_per_account`` RUNNING jobs. The running count is accurate
-    across back-to-back claims in one loop pass because a job flips to
-    running AT CLAIM time (before ``execute_run`` flips the run) and each
-    claim commits, so the next poll sees the updated count.
+    ``max_active_per_account`` RUNNING jobs.
+
+    The skip and the claim form ONE critical section (P2 fix): the
+    account row is locked first (``lock_account``), the running count is
+    read under that lock, and the claim UPDATE + commit hold it until it
+    releases. Two concurrent workers deciding on the same account are
+    therefore serialized: the loser re-reads the count after the winner
+    commits, sees the account at its cap, and skips. The old code snapshotted
+    the running count once in Python before the claim — a stale snapshot
+    plus an unconditional UPDATE is a read-then-write race that can leave
+    the account over its cap under concurrency. Counted unit is RUNNING
+    JOBS (the unit workers claim; a run only flips to running when its
+    attempt starts, so counting runs would understate in-flight work).
+    Losing a claim to a concurrent worker (rowcount 0) falls through to
+    the next candidate instead of giving up — with the cap check under
+    the lock, that fall-through can only ever reach an eligible job.
 
     Consequences: with the default cap of 2 and 4 slots, an account with a
     4-job backlog fills 2 slots and stops — a smaller account waiting in
@@ -126,27 +138,37 @@ async def poll_once(session, *, max_active_per_account: int | None = None) -> in
     smaller accounts (they are always ahead of the capped account's next
     job in scan order).
     """
-    if max_active_per_account is None:
-        candidates = session.query(Job).filter(Job.status == "pending").order_by(Job.id).all()
-    else:
-        running_by_account: dict[int, int] = {}
-        for rj in session.query(Job).filter(Job.status == "running").all():
-            rrid = json.loads(rj.payload_json or "{}").get("run_id")
-            if rrid is None:
-                continue
-            rrun = session.get(Run, rrid)
-            if rrun is not None:
-                running_by_account[rrun.account_id] = running_by_account.get(rrun.account_id, 0) + 1
-        candidates = [
-            job
-            for job in session.query(Job).filter(Job.status == "pending").order_by(Job.id)
-            if not (
-                (run := session.get(Run, json.loads(job.payload_json or "{}").get("run_id")))
-                is not None
-                and running_by_account.get(run.account_id, 0) >= max_active_per_account
+    candidates = session.query(Job).filter(Job.status == "pending").order_by(Job.id).all()
+    if max_active_per_account is not None:
+        # Count RUNNING JOBS per account (the unit workers claim — a run
+        # only flips to running when its attempt starts, so counting runs
+        # would understate in-flight work). The run id lives in the job
+        # payload; extract per dialect.
+        if session.bind.dialect.name == "postgresql":
+            _running_sql = (
+                "select count(*) from jobs j"
+                " join runs r on r.id = jsonb_extract_path_text(j.payload_json::jsonb, 'run_id')::integer"
+                " where j.status = 'running' and r.account_id = :aid"
             )
-        ]
+        else:
+            _running_sql = (
+                "select count(*) from jobs j"
+                " join runs r on r.id = json_extract(j.payload_json, '$.run_id')"
+                " where j.status = 'running' and r.account_id = :aid"
+            )
     for job in candidates:
+        run_id = json.loads(job.payload_json or "{}").get("run_id")
+        if max_active_per_account is not None and run_id is not None:
+            run = session.get(Run, run_id)
+            if run is not None:
+                # Serialize capacity decisions for this account: the lock
+                # makes the count below and the claim below one critical
+                # section across concurrent workers.
+                lock_account(session, run.account_id)
+                running = session.execute(text(_running_sql), {"aid": run.account_id}).scalar()
+                if running >= max_active_per_account:
+                    session.rollback()
+                    continue  # at the cap: leave pending, try the next job
         token = uuid4().hex
         updated = session.execute(
             update(Job)
@@ -159,7 +181,7 @@ async def poll_once(session, *, max_active_per_account: int | None = None) -> in
         )
         if updated.rowcount != 1:
             session.rollback()
-            return 0  # lost the claim to a concurrent worker
+            continue  # lost this job's claim to a concurrent worker; try next
         session.merge(
             JobLease(
                 job_id=job.id,

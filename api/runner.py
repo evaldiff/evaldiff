@@ -81,11 +81,20 @@ async def _execute_case(
     client: httpx.AsyncClient,
     case: dict,
     api_key: str,
-) -> tuple[str, int, int, Score]:
-    """One case: render, model call (with retries), judge. Returns
-    (output, tokens_in, tokens_out, score). May be cancelled on deadline
-    expiry — the cancellation propagates through ``_with_retries`` and
-    ``score_case`` (neither swallows CancelledError)."""
+    *,
+    attempt: str,
+    seq: int,
+    remaining: int | None,
+) -> tuple[str, int, int, Score, str | None]:
+    """One case: render, model call (with retries), judge, persist result.
+    Returns (output, tokens_in, tokens_out, score, output_key).
+
+    The model call and judge run under the caller's deadline guard (they
+    are cancelled in flight on expiry). The result write to storage runs
+    off the event loop (``asyncio.to_thread``) so a slow backend cannot
+    stall lease heartbeats; the deadline is then re-read FRESH after the
+    write lands, so a write that finishes after the deadline still does
+    not charge the case — it raises RunDeadlineExceeded instead."""
     prompt = _render(run.prompt_template, case)
     output, t_in, t_out = await _with_retries(
         call_model,
@@ -104,7 +113,25 @@ async def _execute_case(
         expected=str(case.get("expected", "")),
         rubric=list(case.get("rubric") or []),
     )
-    return output, t_in, t_out, score
+    output_key = None
+    if state.storage is not None and run.id:
+        # Synchronous storage client, off the event loop (P1): a hung or
+        # slow backend cannot stall lease heartbeats. The write is allowed
+        # to FINISH in the background thread (a discarded blob if the
+        # deadline lapsed mid-write), but the DEADLINE is checked after it
+        # lands — a late write must not charge the case. The event loop is
+        # never blocked by the write: it runs in a worker thread, so
+        # heartbeats and concurrent attempts keep running.
+        key = f"runs/{run.id}/attempts/{attempt}/case_{seq}/output.json"
+        payload = {"output": output, "score": score.__dict__}
+        output_key = await asyncio.to_thread(state.storage.put_json, key, payload)
+        # The deadline covers the storage write (NEEDS-DOING C): re-read the
+        # budget FRESH after the write lands — if it lapsed while the write
+        # was in flight, the case is NOT charged (the blob is discarded —
+        # the run is already being settled as failed).
+        if remaining is not None and remaining_deadline_seconds(run) <= 0:
+            raise RunDeadlineExceeded("run deadline exceeded")
+    return output, t_in, t_out, score, output_key
 
 
 async def _execute_cases(run: Run, session: Session, cases: list, protect, attempt: str) -> int:
@@ -142,23 +169,33 @@ async def _execute_cases(run: Run, session: Session, cases: list, protect, attem
                 row = RunCase(run_id=run.id, seq=seq)
                 try:
                     if remaining is not None:
-                        # The deadline covers the WHOLE case, in flight.
+                        # The deadline covers the WHOLE case — model call,
+                        # retries, judge, and the result write to storage.
                         # wait_for cancels the case task on expiry and waits
-                        # for the cancellation to complete.
-                        output, t_in, t_out, score = await asyncio.wait_for(
-                            _execute_case(run, client, c, api_key), timeout=remaining
+                        # for the cancellation to complete; a slow storage
+                        # backend cannot outlive the deadline (P1 fix) and,
+                        # running off-thread, cannot block heartbeats.
+                        _output, t_in, t_out, score, output_key = await asyncio.wait_for(
+                            _execute_case(
+                                run,
+                                client,
+                                c,
+                                api_key,
+                                attempt=attempt,
+                                seq=seq,
+                                remaining=remaining,
+                            ),
+                            timeout=remaining,
                         )
                     else:
-                        output, t_in, t_out, score = await _execute_case(run, client, c, api_key)
+                        _output, t_in, t_out, score, output_key = await _execute_case(
+                            run, client, c, api_key, attempt=attempt, seq=seq, remaining=remaining
+                        )
                     row.score = round(score.score, 4)
                     row.passed = bool(score.score >= run.threshold)
                     row.tokens_in = t_in
                     row.tokens_out = t_out
-                    if state.storage is not None and run.id:
-                        row.output_key = state.storage.put_json(
-                            f"runs/{run.id}/attempts/{attempt}/case_{seq}/output.json",
-                            {"output": output, "score": score.__dict__},
-                        )
+                    row.output_key = output_key
                     ok_cases += 1
                 except asyncio.TimeoutError:
                     # Deadline lapsed mid-case: the in-flight model/retry/
@@ -197,10 +234,13 @@ async def execute_run(
         session.commit()  # release before any model I/O
 
         dataset = run.dataset
+        # The dataset read is a synchronous storage call; run it off the
+        # event loop so a slow backend cannot stall heartbeats or the
+        # deadline guard before the first case starts.
         cases = (
             json.loads(dataset.cases_json)
             if dataset.cases_json
-            else state.storage.get_json(dataset.storage_key)
+            else await asyncio.to_thread(state.storage.get_json, dataset.storage_key)
         )
         cases = cases if isinstance(cases, list) else cases.get("cases", [])
 
