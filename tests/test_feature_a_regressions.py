@@ -10,6 +10,13 @@ P2  Raw-deflate format detection must not depend on network chunk
     zlib-wrapped interpretation (a lone raw-deflate header byte decodes as
     a valid empty zlib stream, and committing there turns the next chunk
     into a hard error instead of a raw-deflate fallback).
+
+Third pass (unbounded detection buffering)
+------------------------------------------
+The pre-settle format-detection buffer must be bounded by the response
+cap, not by the attacker: a stream of valid-but-zero-output deflate
+(empty stored blocks) must be rejected once it passes the detection
+buffer, and a short legal zero-output body must still be accepted.
 """
 
 from __future__ import annotations
@@ -227,3 +234,105 @@ def test_malformed_deflate_body_is_rejected() -> None:
     assert "choices" not in str(excinfo.value) or isinstance(
         excinfo.value, (zlib.error, json.JSONDecodeError)
     )
+
+
+# --- Third review pass: unbounded format-detection buffering --------------
+# The pre-settle buffer must be bounded by the cap, not by the attacker:
+# a body of valid-but-zero-output deflate (empty stored blocks) must not be
+# able to grow the detection buffer past the detection limit.
+
+
+def _empty_block(bfinal: int) -> bytes:
+    """One empty stored deflate block: header byte (BFINAL|BTYPE=00),
+    LEN=0, NLEN=0xFFFF."""
+    return bytes([bfinal]) + (0).to_bytes(2, "little") + (0xFFFF).to_bytes(2, "little")
+
+
+def test_nonfinal_empty_blocks_rejected_at_detection_cap() -> None:
+    """The reviewer's unbounded-buffer attack: a sustained stream of
+    valid *non-final* empty stored blocks (raw deflate, zero decoded
+    output, never terminating) must be rejected once the wire input
+    passes the detection buffer — not buffered indefinitely."""
+    _set_limits(2048, 5.0)
+    # 120,000 non-final empty blocks = 600 KiB of valid raw deflate,
+    # far past the ~67 KiB detection buffer for a 2 KiB cap.
+    wire = _empty_block(0) * 120_000
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        chunks = [wire[i : i + 8192] for i in range(0, len(wire), 8192)]
+        return httpx.Response(
+            200, stream=_ChunkStream(chunks), headers={"Content-Encoding": "deflate"}
+        )
+
+    with __import__("pytest").raises(hl.ResponseLimitExceeded):
+        _post(handler)
+
+
+def test_final_empty_blocks_accepted_with_zero_output() -> None:
+    """Converse: a *short* legal stream of empty stored blocks (each
+    final, zero output) is a valid body and must be accepted — not
+    rejected by the detection cap that bounds the non-final attack."""
+    _set_limits(2048, 5.0)
+    wire = _empty_block(1) * 3  # 15 wire bytes, decodes to b""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            stream=_ChunkStream([wire[:1], wire[1:]]),
+            headers={"Content-Encoding": "deflate"},
+        )
+
+    async def go() -> bytes:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            req = client.build_request(
+                "GET", "https://model.example/x", headers={"Accept-Encoding": "identity"}
+            )
+            resp = await client.send(req, stream=True)
+            return await hl.read_capped_body(resp, max_bytes=2048)
+
+    out = asyncio.run(go())
+    assert out == b""
+
+
+def test_empty_deflate_body_accepted() -> None:
+    """A declared-deflate response with a zero-byte body must still parse —
+    flush on a stream that never saw a wire byte is a no-op, not a
+    'never settled' rejection."""
+    _set_limits(2048, 5.0)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            stream=httpx.ByteStream(b""),
+            headers={"Content-Encoding": "deflate"},
+        )
+
+    async def go() -> bytes:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            req = client.build_request(
+                "GET", "https://model.example/x", headers={"Accept-Encoding": "identity"}
+            )
+            resp = await client.send(req, stream=True)
+            return await hl.read_capped_body(resp, max_bytes=2048)
+
+    assert asyncio.run(go()) == b""
+
+
+def test_sustained_final_empty_blocks_rejected_at_detection_cap() -> None:
+    """A stream of *final* empty blocks that keeps the rival probe alive
+    long enough to exceed the detection buffer is still bounded: the
+    format commits on first final block, but a stream that stays
+    unsettled past the cap must be rejected, not buffered to exhaustion."""
+    _set_limits(2048, 5.0)
+    # Mix: many non-final blocks (keep both probes alive, zero output)
+    # pushed past the detection buffer, then a final block.
+    wire = _empty_block(0) * 120_000 + _empty_block(1)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        chunks = [wire[i : i + 8192] for i in range(0, len(wire), 8192)]
+        return httpx.Response(
+            200, stream=_ChunkStream(chunks), headers={"Content-Encoding": "deflate"}
+        )
+
+    with __import__("pytest").raises(hl.ResponseLimitExceeded):
+        _post(handler)

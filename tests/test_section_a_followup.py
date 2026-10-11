@@ -58,8 +58,8 @@ def test_decompression_bomb_is_capped_without_allocating_expansion() -> None:
 
     real_decoder_for = hl._decoder_for
 
-    def tracking(encoding: str):
-        d = real_decoder_for(encoding)
+    def tracking(encoding: str, **kwargs):
+        d = real_decoder_for(encoding, **kwargs)
         return TrackingDecoder(d) if d is not None else None
 
     hl._decoder_for = tracking

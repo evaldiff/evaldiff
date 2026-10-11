@@ -57,7 +57,7 @@ import contextlib
 import inspect
 import json
 import zlib
-from typing import Any
+from typing import Any, NoReturn
 
 import httpx
 
@@ -118,81 +118,163 @@ class _RawDeflateDecoder:
     (zlib-wrapped vs raw deflate stream).
 
     The format can only be settled from the bytes themselves, and it must
-    not depend on where the network chunk boundaries fall. So while the
-    format is unsettled we **accumulate** the wire input and, on each call,
-    re-try both interpretations on the whole accumulated buffer:
+    not depend on where the network chunk boundaries fall. Until it is
+    settled, every wire chunk is fed to **two stateful probes in
+    parallel** — a zlib-wrapped decoder (``wbits=15``) and a raw-deflate
+    decoder (``wbits=-15``):
 
-    - zlib-wrapped first (``wbits=15``);
-    - then raw deflate (``wbits=-15``).
+    - a probe that raises is dead: a *valid* deflate stream (either form)
+      fed to a stateful zlib decoder never raises on incomplete input, it
+      holds it, so a raise is conclusive evidence the format is not this
+      one;
+    - a probe that reaches end-of-stream has decoded the whole body
+      cleanly — that interpretation wins;
+    - a probe that never settles (still incomplete) and a body that
+      exhausts the detection buffer (``max_bytes`` — a body cannot
+      legally exceed the cap — or the decode window, whichever is larger)
+      is rejected. This is what bounds the pre-commit buffer: it can never
+      grow past ``detection buffer + one window``.
 
-    Whichever interpretation actually *yields output* wins and is
-    committed; from then on the committed stateful decoder is used
-    directly and ``residual`` (its ``unconsumed_tail``) drives the window
-    loop in ``_accept_chunk``.
-
-    Crucially, a ``zlib.error`` on a prefix does **not** commit the other
-    format: a mid-block prefix of a *valid* zlib-wrapped stream can raise
-    ("invalid stored block lengths") while a longer prefix decodes fine.
-    We only ever commit on positive output, so the format is established
-    by evidence, not by a failed guess. A genuinely malformed stream is
-    reported by ``flush`` at end-of-stream, once the whole body has
-    accumulated and both interpretations have had their chance.
+    Probing is stateful — each wire byte is decoded by each live probe
+    exactly once — so detection is linear in wire bytes, not O(n²) in
+    re-decoding the accumulated prefix. Committing on *positive output
+    alone* is unsound (a stream of empty stored blocks is valid raw
+    deflate that decodes to nothing, and would buffer forever); committing
+    on *clean end-of-stream or a dead rival* is sound.
     """
 
-    def __init__(self) -> None:
+    _WINDOW = 64 * 1024  # max bytes a single decompress call may emit
+
+    def __init__(self, cap: int = 0) -> None:
+        self._active: Any = None  # the committed zlib.decompressobj
         self._committed = False
-        self._active: Any = None  # a zlib.decompressobj once committed
-        self._acc = b""  # wire input held while the format is unsettled
+        # The two live probes (one per interpretation), each stateful.
+        self._z: Any = zlib.decompressobj(15)
+        self._r: Any = zlib.decompressobj(-zlib.MAX_WBITS)
+        self._z_dead = self._r_dead = False
+        # Decoded output each probe has produced so far. Only the committed
+        # probe's buffer is ever returned; the rival's is discarded on settle.
+        self._z_buf = bytearray()
+        self._r_buf = bytearray()
+        self._wire_seen = 0  # total wire bytes fed while unsettled
+        self._cap = cap
+
+    def _detection_buffer(self) -> int:
+        """Largest wire size a *valid* body that decodes to <= ``cap`` bytes
+        can have, plus one decode window of in-flight input.
+
+        Deflate's worst case is stored blocks: 5 bytes of overhead per
+        65535 of payload, plus the zlib header/ADLER (a constant). A body
+        whose wire size exceeds this cannot decode to <= ``cap`` without
+        being malformed, so it is rejected — this bounds the pre-settle
+        buffering while still accepting every legal body.
+        """
+        base = self._cap if self._cap > 0 else self._WINDOW
+        return base + (base // 65535 + 1) * 5 + self._WINDOW + 16
+
+    def _probe(self, d: Any, data: bytes) -> tuple[bytes, bool]:
+        """Feed ``data`` to one stateful probe; return (output, dead)."""
+        try:
+            return d.decompress(data, self._WINDOW), False
+        except zlib.error:
+            return b"", True
+
+    def _reject(self, msg: str) -> NoReturn:
+        self._z_buf = self._r_buf = b""
+        self._z = self._r = None
+        raise ResponseLimitExceeded(msg)
 
     def decompress(self, data: bytes, max_out: int) -> bytes:
         if self._committed:
             assert self._active is not None
             return self._active.decompress(data, max_out)
-        self._acc += data
-        # Settle the format on the accumulated buffer: the first
-        # interpretation that yields output wins.
-        for wbits in (15, -zlib.MAX_WBITS):
-            try:
-                d = zlib.decompressobj(wbits)
-                out = d.decompress(self._acc, max_out)
-            except zlib.error:
-                continue
-            if out:
-                self._active = d
-                self._committed = True
-                self._acc = b""
-                return out
-        # Incomplete stream — neither interpretation produced output yet.
-        # Keep the buffer; wait for more wire data.
+        if not data:
+            return b""
+        self._wire_seen += len(data)
+        if not self._z_dead:
+            out, dead = self._probe(self._z, data)
+            self._z_dead = dead
+            self._z_buf += out
+        if not self._r_dead:
+            out, dead = self._probe(self._r, data)
+            self._r_dead = dead
+            self._r_buf += out
+        # A probe that decoded more than ``cap`` bytes is a bomb (a legal
+        # body decodes to <= cap): reject it before settling.
+        if self._cap > 0 and (len(self._z_buf) > self._cap or len(self._r_buf) > self._cap):
+            self._reject(f"deflate body exceeds limit: {self._cap} bytes")
+        # Settle the format on conclusive evidence:
+        #  1. A probe reached end-of-stream -> it decoded the whole body
+        #     cleanly; commit it immediately. Committing at eof (rather
+        #     than waiting for output) is what keeps buffering bounded:
+        #     a valid stream of empty stored blocks reaches eof and
+        #     commits with zero output instead of buffering forever.
+        #  2. One probe is dead and the other produced output -> the live
+        #     deflate decoder never raises on incomplete input, so a raise
+        #     is conclusive that the format is not the dead probe's.
+        #  3. Both dead before either settled -> conclusively malformed.
+        #  4. Otherwise keep buffering (bounded by the detection limit).
+        z_done, r_done = self._z.eof, self._r.eof
+        if z_done or r_done:
+            best = (
+                self._z
+                if z_done and (not r_done or len(self._z_buf) >= len(self._r_buf))
+                else self._r
+            )
+            return self._settle(best)
+        if self._z_dead and not self._r_dead and self._r_buf:
+            return self._settle(self._r)
+        if self._r_dead and not self._z_dead and self._z_buf:
+            return self._settle(self._z)
+        if self._z_dead and self._r_dead:
+            self._reject("deflate body is neither a valid zlib stream nor a raw deflate stream")
+        if self._wire_seen > self._detection_buffer():
+            self._reject(
+                f"deflate body cannot be format-detected within {self._detection_buffer()} bytes"
+            )
         return b""
+
+    def _settle(self, best: Any) -> bytes:
+        """Commit ``best``; return its decoded output so far (the bytes the
+        caller has not yet emitted). Any ``unconsumed_tail`` the committed
+        decoder still holds is drained by the residual loop in
+        ``_accept_chunk`` — re-feeding it here would discard its output."""
+        buf = self._z_buf if best is self._z else self._r_buf
+        self._z_buf = self._r_buf = b""
+        self._active = best
+        self._committed = True
+        if best is self._z:
+            self._r = None
+        else:
+            self._z = None
+        return bytes(buf)
 
     @property
     def residual(self) -> bytes:
         if self._committed:
             assert self._active is not None
             return self._active.unconsumed_tail
-        return b""  # accumulating: nothing to feed back yet
+        return b""  # unsettled: nothing to feed back yet
 
     def flush(self) -> bytes:
         if self._committed:
             assert self._active is not None
             return self._active.flush()
-        if not self._acc:
+        if self._wire_seen == 0:
             return b""  # empty body: nothing to settle
-        # End-of-stream arrived before the format settled: give both
-        # interpretations a final shot at the complete buffer.
-        for wbits in (15, -zlib.MAX_WBITS):
-            try:
-                d = zlib.decompressobj(wbits)
-                out = d.decompress(self._acc)
-            except zlib.error:
-                continue
-            self._active = d
-            self._committed = True
-            self._acc = b""
-            return out + d.flush()
-        # Neither format could decode the body — malformed.
-        raise zlib.error("deflate body could not be decoded as zlib or raw deflate")
+        # End-of-stream: a probe that completed cleanly wins; if both
+        # probes are still mid-stream the body is truncated/malformed.
+        if self._z.eof or self._r.eof:
+            best = (
+                self._z
+                if self._z.eof and (not self._r.eof or len(self._z_buf) >= len(self._r_buf))
+                else self._r
+            )
+            out = self._settle(best)
+            return out + best.flush()
+        self._reject(
+            "deflate body ended before the stream completed in either zlib or raw-deflate form"
+        )
 
 
 class _BrotliDecoder:
@@ -213,12 +295,13 @@ class _BrotliDecoder:
         return b""
 
 
-def _decoder_for(encoding: str):
+def _decoder_for(encoding: str, *, max_bytes: int = 0):
     """Incremental decoder for the declared Content-Encoding, or None (identity).
 
     Every decoder honors a per-call output cap (``decompress(data, max_out)``),
     which is what keeps decompression-bomb allocation bounded. Encodings with
-    no bounded decoder available are rejected by the caller.
+    no bounded decoder available are rejected by the caller. ``max_bytes``
+    seeds the deflate format-detection buffer so it is bounded by the cap.
     """
     enc = encoding.strip().lower()
     if not enc or enc == "identity":
@@ -227,7 +310,7 @@ def _decoder_for(encoding: str):
         # wbits=47 auto-detects the gzip wrapper (and plain zlib streams).
         return _ZlibDecoder(47)
     if enc == "deflate":
-        return _RawDeflateDecoder()
+        return _RawDeflateDecoder(max_bytes)
     if enc == "br":
         return _BrotliDecoder()
     raise ValueError(f"content-encoding {encoding!r} cannot be decoded with a bound")
@@ -292,7 +375,7 @@ async def read_capped_body(response: httpx.Response, *, max_bytes: int) -> bytes
     idle = _limits()[1]
     encoding = response.headers.get("content-encoding") or ""
     try:
-        decoder = _decoder_for(encoding)
+        decoder = _decoder_for(encoding, max_bytes=max_bytes)
     except ValueError as exc:
         # We asked for identity; a server that ignores us and compresses
         # with a codec we cannot bound must not get to allocate.
