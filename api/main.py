@@ -26,6 +26,7 @@ from .models import Account, Dataset, Run
 from .quota import (
     ledger_metadata,
     migrate_legacy_usage,
+    migrate_run_deadline_column,
     now_period,
     reserve_deadline,
     used_cases_for,
@@ -179,6 +180,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             )
             with state.session_factory() as session:
                 migrate_legacy_usage(session)
+                migrate_run_deadline_column(session)
             if cipher.primary is None:
                 logging.getLogger("evaldiff").warning(
                     "Development mode: EVALDIFF_SECRET_KEY is not set; model credentials "

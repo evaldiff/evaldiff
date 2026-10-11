@@ -27,7 +27,7 @@ from sqlalchemy.orm import Session
 
 from .db import state
 from .http_limits import post_json_bounded
-from .judges import score_case
+from .judges import Score, score_case
 from .leases import LeaseLost, fence
 from .models import Run, RunCase
 from .quota import remaining_deadline_seconds, settle_run
@@ -76,12 +76,49 @@ async def call_model(
     return text, tokens_in, tokens_out
 
 
+async def _execute_case(
+    run: Run,
+    client: httpx.AsyncClient,
+    case: dict,
+    api_key: str,
+) -> tuple[str, int, int, Score]:
+    """One case: render, model call (with retries), judge. Returns
+    (output, tokens_in, tokens_out, score). May be cancelled on deadline
+    expiry — the cancellation propagates through ``_with_retries`` and
+    ``score_case`` (neither swallows CancelledError)."""
+    prompt = _render(run.prompt_template, case)
+    output, t_in, t_out = await _with_retries(
+        call_model,
+        client,
+        endpoint=run.endpoint,
+        model=run.model,
+        api_key=api_key,
+        prompt=prompt,
+    )
+    score = await score_case(
+        client,
+        endpoint=run.endpoint,
+        model=run.model,
+        api_key=api_key,
+        output=output,
+        expected=str(case.get("expected", "")),
+        rubric=list(case.get("rubric") or []),
+    )
+    return output, t_in, t_out, score
+
+
 async def _execute_cases(run: Run, session: Session, cases: list, protect, attempt: str) -> int:
     """Run every case through model + judge. Returns the number of OK cases.
 
     Each case row is flushed and committed immediately: the write
     transaction around a case write is milliseconds, not the whole run —
     concurrent API writers are not blocked while models are called.
+
+    Deadline enforcement (NEEDS-DOING C): the run's absolute deadline
+    bounds EVERY part of a case — model call, retries, judge, storage.
+    When the deadline lapses mid-case, ``asyncio.wait_for`` cancels the
+    in-flight work; the case is NOT charged and the run is settled
+    terminally by ``execute_run`` (raised as RunDeadlineExceeded).
     """
     ok_cases = 0
     # All model traffic goes through the in-process SSRF guard: the target
@@ -101,26 +138,18 @@ async def _execute_cases(run: Run, session: Session, cases: list, protect, attem
                 # Refuse to start a new case when there is no meaningful time
                 # left (one case involves a model call + judge call).
                 _check_deadline(run)
+                remaining = remaining_deadline_seconds(run)
                 row = RunCase(run_id=run.id, seq=seq)
                 try:
-                    prompt = _render(run.prompt_template, c)
-                    output, t_in, t_out = await _with_retries(
-                        call_model,
-                        client,
-                        endpoint=run.endpoint,
-                        model=run.model,
-                        api_key=api_key,
-                        prompt=prompt,
-                    )
-                    score = await score_case(
-                        client,
-                        endpoint=run.endpoint,
-                        model=run.model,
-                        api_key=api_key,
-                        output=output,
-                        expected=str(c.get("expected", "")),
-                        rubric=list(c.get("rubric") or []),
-                    )
+                    if remaining is not None:
+                        # The deadline covers the WHOLE case, in flight.
+                        # wait_for cancels the case task on expiry and waits
+                        # for the cancellation to complete.
+                        output, t_in, t_out, score = await asyncio.wait_for(
+                            _execute_case(run, client, c, api_key), timeout=remaining
+                        )
+                    else:
+                        output, t_in, t_out, score = await _execute_case(run, client, c, api_key)
                     row.score = round(score.score, 4)
                     row.passed = bool(score.score >= run.threshold)
                     row.tokens_in = t_in
@@ -131,6 +160,11 @@ async def _execute_cases(run: Run, session: Session, cases: list, protect, attem
                             {"output": output, "score": score.__dict__},
                         )
                     ok_cases += 1
+                except asyncio.TimeoutError:
+                    # Deadline lapsed mid-case: the in-flight model/retry/
+                    # judge work is already cancelled. The case is not
+                    # charged; the run is settled terminally in execute_run.
+                    raise RunDeadlineExceeded("run deadline exceeded") from None
                 except Exception as exc:  # noqa: BLE001
                     # Execution error: case is not charged (see settle_run).
                     row.error = f"{type(exc).__name__}: {exc}"

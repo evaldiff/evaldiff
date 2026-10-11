@@ -230,6 +230,44 @@ def remaining_deadline_seconds(run: Run) -> int | None:
     )
 
 
+def migrate_run_deadline_column(session: Session) -> None:
+    """Add ``runs.deadline_at`` to databases created before Part C.
+
+    ``create_all`` only creates missing TABLES — a pre-Part-C database
+    stays healthy-looking while every run submission fails with
+    ``no column named deadline_at``. This migration alters the existing
+    table exactly once. Guarded by a marker row (portable across the
+    psycopg 3.x ``rowcount == -1`` quirk), and additionally no-ops when
+    the column already exists (e.g. a freshly ``create_all``-ed schema).
+    The caller must stop all old processes first (as with the legacy
+    usage backfill).
+    """
+    if (
+        session.execute(
+            select(MIGRATIONS.c.name).where(MIGRATIONS.c.name == "run_deadline_v1").limit(1)
+        ).first()
+        is not None
+    ):
+        return
+    bind = session.bind
+    if bind.dialect.name == "postgresql":
+        exists = session.execute(
+            text(
+                "SELECT 1 FROM information_schema.columns"
+                " WHERE table_schema = current_schema AND table_name = 'runs'"
+                " AND column_name = 'deadline_at' LIMIT 1"
+            )
+        ).first()
+        if exists is None:
+            session.execute(text("ALTER TABLE runs ADD COLUMN deadline_at TIMESTAMP"))
+    else:
+        cols = session.execute(text("PRAGMA table_info(runs)")).fetchall()
+        if not any(col[1] == "deadline_at" for col in cols):
+            session.execute(text("ALTER TABLE runs ADD COLUMN deadline_at DATETIME"))
+    session.execute(MIGRATIONS.insert().values(name="run_deadline_v1"))
+    session.commit()
+
+
 def migrate_legacy_usage(session: Session) -> None:
     """Backfill once, atomically, before accepting requests or starting workers.
 

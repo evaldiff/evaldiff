@@ -137,6 +137,22 @@ python -m api.migrate_secrets
 python -m api.migrate_secrets --check
 ```
 
+
+### 0.0.18+: run-wide deadlines (Part C)
+
+`runs` gains a `deadline_at` column. `create_all` cannot alter an existing
+table, so startup runs a one-off, idempotent migration
+(`migrate_run_deadline_column`, marker row `run_deadline_v1` in
+`quota_migrations`). No manual step is required: back up the database as
+usual, stop old replicas, start the new image — the column is added before
+the worker starts. After upgrade, verify with:
+
+```sh
+docker compose exec -T db psql -U evaldiff -d evaldiff \
+  -c "select column_name from information_schema.columns
+      where table_schema='public' and table_name='runs' and column_name='deadline_at'"
+```
+
 ### Restore and rollback
 
 Restore into an isolated stack first; never test recovery against the live DB.
@@ -193,3 +209,4 @@ The test suite covers missing/invalid configuration, long values, atomic rollbac
 idempotency, rotation, and SQLite backup restoration with queued-run execution.
 Migration/rotation tests also run against PostgreSQL when
 `EVALDIFF_TEST_POSTGRES_URL` is set, including the legacy `varchar(512)` upgrade.
+

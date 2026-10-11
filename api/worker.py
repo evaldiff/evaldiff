@@ -105,37 +105,72 @@ def recover_abandoned_jobs(session) -> int:
     return recovered
 
 
-async def poll_once(session) -> int:
-    """Claim the oldest pending job. Returns the job id, or 0 when there is
-    none (or the claim was lost to a concurrent worker). The lease token is
-    the job's ``claimed_by`` after the claim commits."""
-    job = session.query(Job).filter(Job.status == "pending").order_by(Job.id).first()
-    if job is None:
-        return 0
-    job_id = job.id
-    token = uuid4().hex
-    updated = session.execute(
-        update(Job)
-        .where(
-            Job.id == job_id,
-            Job.status == "pending",
+async def poll_once(session, *, max_active_per_account: int | None = None) -> int:
+    """Claim the oldest pending job whose account is NOT already at its
+    active-run limit. Returns the job id, or 0 when there is none (or the
+    claim was lost to a concurrent worker). The lease token is the job's
+    ``claimed_by`` after the claim commits.
+
+    Fairness (NEEDS-DOING C): a pending job is SKIPPED (left pending,
+    attempts not incremented) when its account already has
+    ``max_active_per_account`` RUNNING jobs. The running count is accurate
+    across back-to-back claims in one loop pass because a job flips to
+    running AT CLAIM time (before ``execute_run`` flips the run) and each
+    claim commits, so the next poll sees the updated count.
+
+    Consequences: with the default cap of 2 and 4 slots, an account with a
+    4-job backlog fills 2 slots and stops — a smaller account waiting in
+    line claims before the backlog's next job is considered. When the
+    backlog account's jobs finish, its remaining jobs drain. No deadlock
+    (the counted set shrinks as jobs complete) and no starvation of
+    smaller accounts (they are always ahead of the capped account's next
+    job in scan order).
+    """
+    if max_active_per_account is None:
+        candidates = session.query(Job).filter(Job.status == "pending").order_by(Job.id).all()
+    else:
+        running_by_account: dict[int, int] = {}
+        for rj in session.query(Job).filter(Job.status == "running").all():
+            rrid = json.loads(rj.payload_json or "{}").get("run_id")
+            if rrid is None:
+                continue
+            rrun = session.get(Run, rrid)
+            if rrun is not None:
+                running_by_account[rrun.account_id] = running_by_account.get(rrun.account_id, 0) + 1
+        candidates = [
+            job
+            for job in session.query(Job).filter(Job.status == "pending").order_by(Job.id)
+            if not (
+                (run := session.get(Run, json.loads(job.payload_json or "{}").get("run_id")))
+                is not None
+                and running_by_account.get(run.account_id, 0) >= max_active_per_account
+            )
+        ]
+    for job in candidates:
+        token = uuid4().hex
+        updated = session.execute(
+            update(Job)
+            .where(
+                Job.id == job.id,
+                Job.status == "pending",
+            )
+            .values(status="running", claimed_by=token, attempts=Job.attempts + 1)
+            .execution_options(synchronize_session=False)
         )
-        .values(status="running", claimed_by=token, attempts=Job.attempts + 1)
-        .execution_options(synchronize_session=False)
-    )
-    if updated.rowcount != 1:
-        session.rollback()
-        return 0
-    session.merge(
-        JobLease(
-            job_id=job_id,
-            token=token,
-            expires_at=datetime.now(timezone.utc).replace(tzinfo=None)
-            + timedelta(seconds=LEASE_SECONDS),
+        if updated.rowcount != 1:
+            session.rollback()
+            return 0  # lost the claim to a concurrent worker
+        session.merge(
+            JobLease(
+                job_id=job.id,
+                token=token,
+                expires_at=datetime.now(timezone.utc).replace(tzinfo=None)
+                + timedelta(seconds=LEASE_SECONDS),
+            )
         )
-    )
-    session.commit()
-    return job_id
+        session.commit()
+        return job.id
+    return 0
 
 
 async def _heartbeat(job_id: int, token: str, attempt: asyncio.Task) -> None:
@@ -188,7 +223,9 @@ async def worker_loop(stop: asyncio.Event, interval: float = 2.0) -> None:
                 try:
                     with state.session_factory() as session:
                         recover_abandoned_jobs(session)
-                        job_id = await poll_once(session)
+                        job_id = await poll_once(
+                            session, max_active_per_account=_max_active_per_account()
+                        )
                         if not job_id:
                             break
                         job = session.get(Job, job_id)
@@ -218,6 +255,17 @@ def _worker_concurrency() -> int:
 
         settings = Settings()
     return max(0, int(getattr(settings, "worker_concurrency", 0)))
+
+
+def _max_active_per_account() -> int | None:
+    """Per-account active-run limit for fair claiming; None when disabled."""
+    settings = state.settings
+    if settings is None:
+        from .settings import Settings
+
+        settings = Settings()
+    value = int(getattr(settings, "max_active_runs_per_account", 0))
+    return value if value > 0 else None
 
 
 def _finish_job(job_id: int, token: str) -> None:

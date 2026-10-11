@@ -14,14 +14,22 @@ import uuid
 from datetime import datetime, timedelta, timezone
 
 import pytest
-from sqlalchemy import create_engine, text, update
+from sqlalchemy import create_engine, select, text, update
 from sqlalchemy.engine import make_url
 from sqlalchemy.orm import sessionmaker
 
 from api.db import Base, make_engine, state
 from api.leases import JobLease
 from api.models import Account, Dataset, Job, Run, RunCase
-from api.quota import ledger_metadata, now_period, reserve, reserve_deadline, used_cases_for
+from api.quota import (
+    MIGRATIONS,
+    ledger_metadata,
+    migrate_run_deadline_column,
+    now_period,
+    reserve,
+    reserve_deadline,
+    used_cases_for,
+)
 from api.runner import execute_run
 from api.settings import Settings
 from api.storage import InMemoryStorage
@@ -94,6 +102,42 @@ def seed(sessions, *, count=2, deadline: int | None = None):
             reserve_deadline(session, run.id, deadline)
         enqueue_run(session, run.id)
         return account.id, run.id
+
+
+def seed_backlog(sessions, *, n=1, count=1):
+    """ONE account with ``n`` queued runs (same account, sequential ids).
+    Returns (account_id, [run_id, ...])."""
+    with sessions() as session:
+        account = Account(email=uuid.uuid4().hex + "@example.com", quota_period=now_period())
+        dataset = Dataset(
+            account=account,
+            name="d",
+            case_count=count,
+            cases_json=json.dumps([{"input": "x", "expected": "x"}] * count),
+        )
+        run_ids = []
+        for _ in range(n):
+            run = Run(
+                account=account,
+                dataset=dataset,
+                model="m",
+                endpoint="https://example.com",
+                total_cases=count,
+                status="queued",
+            )
+            session.add(run)
+            session.flush()
+            reserve(
+                session,
+                run_id=run.id,
+                account_id=account.id,
+                case_count=count,
+                period=now_period(),
+                quota=10_000,
+            )
+            enqueue_run(session, run.id)
+            run_ids.append(run.id)
+        return account.id, run_ids
 
 
 def now_utc():
@@ -332,3 +376,97 @@ def test_disabled_deadline_runs_unbounded(sessions, monkeypatch):
     with sessions() as session:
         assert session.get(Run, rid).status == "done"
         assert used_cases_for(aid, now_period(), session) == 2
+
+
+def test_deadline_cancels_in_flight_case(sessions, monkeypatch):
+    """P1: the deadline must stop an IN-FLIGHT model call, not just refuse
+    to start a new case. A model call that finishes after the deadline must
+    be cancelled, the run failed, and the case NOT charged."""
+    aid, rid = seed(sessions, count=2, deadline=2)
+    state_holder: dict = {}
+
+    async def slow_model(*args, **kwargs):
+        state_holder["entered"] = True
+        try:
+            await asyncio.sleep(30)  # far past the deadline
+        except asyncio.CancelledError:
+            state_holder["cancelled"] = True
+            raise
+        return "x", 1, 1
+
+    monkeypatch.setattr("api.runner.call_model", slow_model)
+    jid, token = claim(sessions, rid)
+    asyncio.run(execute_run(rid, job_id=jid, lease_token=token))
+    with sessions() as session:
+        run = session.get(Run, rid)
+        assert run.status == "failed"
+        assert "deadline" in (run.error or "").lower()
+        assert state_holder.get("cancelled")  # the in-flight call was cancelled
+        assert session.query(RunCase).count() == 0  # no case produced/charged
+        assert used_cases_for(aid, now_period(), session) == 0  # full refund
+
+
+def test_legacy_database_gains_deadline_column(sessions):
+    """P1: a pre-Part-C schema (no deadline_at column) must be migrated at
+    startup, not left failing with 'no column named deadline_at'."""
+    with sessions() as session:
+        if session.bind.dialect.name == "sqlite":
+            cols = [c[1] for c in session.execute(text("PRAGMA table_info(runs)")).fetchall()]
+            assert "deadline_at" in cols  # create_all gave us the column
+            session.execute(text("ALTER TABLE runs DROP COLUMN deadline_at"))
+        else:
+            session.execute(text("ALTER TABLE runs DROP COLUMN deadline_at"))
+        session.commit()
+    with sessions() as session:
+        assert (
+            session.execute(
+                select(MIGRATIONS.c.name).where(MIGRATIONS.c.name == "run_deadline_v1")
+            ).first()
+            is None
+        )
+        migrate_run_deadline_column(session)
+    # Idempotent: a second call must be a no-op (marker row guards it).
+    with sessions() as session:
+        migrate_run_deadline_column(session)
+    with sessions() as session:
+        if session.bind.dialect.name == "sqlite":
+            cols = [c[1] for c in session.execute(text("PRAGMA table_info(runs)")).fetchall()]
+        else:
+            cols = [
+                r[0]
+                for r in session.execute(
+                    text(
+                        "SELECT column_name FROM information_schema.columns"
+                        " WHERE table_schema = current_schema AND table_name = 'runs'"
+                    )
+                ).fetchall()
+            ]
+        assert "deadline_at" in cols
+
+
+def test_backlog_account_cannot_monopolize_slots(sessions):
+    """P2: with an active cap of 1, a 4-job backlog (ONE account) cannot
+    fill all slots — the second claim must go to the smaller account."""
+    # Backlog account A: 4 jobs in one account (sequential ids, first is
+    # oldest). B: 1 job, created after A's.
+    _, rid_a_list = seed_backlog(sessions, n=4, count=1)
+    rid_a1 = rid_a_list[0]
+    _, rid_b1 = seed(sessions, count=1)
+
+    claimed_run_ids: list[int] = []
+    for _ in range(4):
+        with sessions() as session:
+            jid = asyncio.run(poll_once(session, max_active_per_account=1))
+            if not jid:
+                break
+            run_id = json.loads(session.get(Job, jid).payload_json)["run_id"]
+            claimed_run_ids.append(run_id)
+    # Slot 1: A's first job (oldest). A is now at its cap of 1, so A2-A4
+    # are skipped and slot 2 goes to B. A plain id-order claim (the old
+    # behavior) would have given A all four slots — monopolization.
+    assert claimed_run_ids[0] == rid_a1
+    assert rid_b1 in claimed_run_ids[1:]
+    assert sum(1 for r in claimed_run_ids if r in rid_a_list) == 1  # A got 1 slot
+    with sessions() as session:
+        # A's remaining backlog stays pending (drained after A1 finishes).
+        assert session.query(Job).filter(Job.status == "pending").count() == 3
