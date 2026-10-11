@@ -95,6 +95,10 @@ class Run(Base):
     total_cost_usd: Mapped[float] = mapped_column(Float, default=0.0)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    # Run-wide deadline (NEEDS-DOING C): absolute expiry, persisted at
+    # enqueue. A crash or a reclaimed attempt can never reset the budget —
+    # the remaining time is always deadline_at minus now.
+    deadline_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
     account: Mapped[Account] = relationship(back_populates="runs")
     dataset: Mapped[Dataset] = relationship(back_populates="runs")

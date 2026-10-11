@@ -30,9 +30,13 @@ from .http_limits import post_json_bounded
 from .judges import score_case
 from .leases import LeaseLost, fence
 from .models import Run, RunCase
-from .quota import settle_run
+from .quota import remaining_deadline_seconds, settle_run
 from .secrets import decrypt_api_key
 from .ssrf_guard import SSRFGuard
+
+
+class RunDeadlineExceeded(Exception):
+    """The run's persisted wall-clock budget is spent (NEEDS-DOING C)."""
 
 
 async def call_model(
@@ -92,6 +96,11 @@ async def _execute_cases(run: Run, session: Session, cases: list, protect, attem
         api_key = decrypt_api_key(run.api_key_ref, settings=state.settings)
         async with httpx.AsyncClient(proxy=guard.proxy_url) as client:
             for seq, c in enumerate(cases):
+                # Run-wide deadline (NEEDS-DOING C): the persisted budget is
+                # absolute, so a reclaimed attempt inherits what was left.
+                # Refuse to start a new case when there is no meaningful time
+                # left (one case involves a model call + judge call).
+                _check_deadline(run)
                 row = RunCase(run_id=run.id, seq=seq)
                 try:
                     prompt = _render(run.prompt_template, c)
@@ -220,3 +229,13 @@ def _render(template: str, case: dict) -> str:
             out = out.replace("{{ " + key + " }}", str(value))
             out = out.replace("{{" + key + "}}", str(value))
     return out
+
+
+def _check_deadline(run: Run) -> None:
+    """Raise when the run's persisted deadline budget is spent.
+
+    ``None`` (no deadline set, or limit disabled) means unlimited.
+    """
+    remaining = remaining_deadline_seconds(run)
+    if remaining is not None and remaining <= 0:
+        raise RunDeadlineExceeded("run deadline exceeded")

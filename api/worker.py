@@ -106,6 +106,9 @@ def recover_abandoned_jobs(session) -> int:
 
 
 async def poll_once(session) -> int:
+    """Claim the oldest pending job. Returns the job id, or 0 when there is
+    none (or the claim was lost to a concurrent worker). The lease token is
+    the job's ``claimed_by`` after the claim commits."""
     job = session.query(Job).filter(Job.status == "pending").order_by(Job.id).first()
     if job is None:
         return 0
@@ -149,40 +152,72 @@ async def _heartbeat(job_id: int, token: str, attempt: asyncio.Task) -> None:
         attempt.cancel()
 
 
+async def _run_attempt(job_id: int, token: str, run_id: int) -> None:
+    """Execute one job and finalize its lease; owns its heartbeat task."""
+    attempt = asyncio.create_task(execute_run(run_id, job_id=job_id, lease_token=token))
+    heartbeat = asyncio.create_task(_heartbeat(job_id, token, attempt))
+    try:
+        await attempt
+        _finish_job(job_id, token)
+    except asyncio.CancelledError:
+        if not heartbeat.done():
+            raise  # shutdown cancellation, not a failed heartbeat
+    finally:
+        if not heartbeat.done():
+            heartbeat.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await heartbeat
+
+
 async def worker_loop(stop: asyncio.Event, interval: float = 2.0) -> None:
-    while not stop.is_set():
-        try:
-            with state.session_factory() as session:
-                recover_abandoned_jobs(session)
-                job_id = await poll_once(session)
-                job = session.get(Job, job_id) if job_id else None
-                token = job.claimed_by if job else None
-                payload = json.loads(job.payload_json) if job else {}
-            if job_id:
-                attempt = asyncio.create_task(
-                    execute_run(
-                        payload["run_id"],
-                        job_id=job_id,
-                        lease_token=token,
-                    )
-                )
-                heartbeat = asyncio.create_task(_heartbeat(job_id, token, attempt))
+    active: set[asyncio.Task] = set()
+    try:
+        while not stop.is_set():
+            # Reap finished attempts so the slot count stays accurate.
+            if active:
+                for t in list(active):
+                    if t.done():
+                        active.discard(t)
+                        with contextlib.suppress(Exception):
+                            t.result()
+            limit = _worker_concurrency()
+            if not limit:
+                # Concurrency disabled: fall back to a plain poll.
+                limit = 1
+            while len(active) < limit and not stop.is_set():
                 try:
-                    await attempt
-                    _finish_job(job_id, token)
-                except asyncio.CancelledError:
-                    if not heartbeat.done():
-                        raise  # shutdown cancellation, not a failed heartbeat
-                finally:
-                    heartbeat.cancel()
-                    with contextlib.suppress(asyncio.CancelledError):
-                        await heartbeat
-        except Exception:
-            log.exception("job loop error")
-        try:
-            await asyncio.wait_for(stop.wait(), timeout=interval)
-        except asyncio.TimeoutError:
-            pass
+                    with state.session_factory() as session:
+                        recover_abandoned_jobs(session)
+                        job_id = await poll_once(session)
+                        if not job_id:
+                            break
+                        job = session.get(Job, job_id)
+                        token = job.claimed_by
+                        payload = json.loads(job.payload_json or "{}")
+                        run_id = payload["run_id"]
+                except Exception:
+                    log.exception("job claim error")
+                    break
+                active.add(asyncio.create_task(_run_attempt(job_id, token, run_id)))
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=interval)
+            except asyncio.TimeoutError:
+                pass
+    finally:
+        # Shutdown: cancel anything still in flight.
+        for t in active:
+            t.cancel()
+        if active:
+            await asyncio.gather(*active, return_exceptions=True)
+
+
+def _worker_concurrency() -> int:
+    settings = state.settings
+    if settings is None:
+        from .settings import Settings
+
+        settings = Settings()
+    return max(0, int(getattr(settings, "worker_concurrency", 0)))
 
 
 def _finish_job(job_id: int, token: str) -> None:

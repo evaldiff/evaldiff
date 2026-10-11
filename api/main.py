@@ -23,7 +23,13 @@ from .db import Base, get_session, make_engine, state
 from .diff import compute_diff, diff_to_markdown, run_to_markdown
 from .migrate_secrets import verify_credentials
 from .models import Account, Dataset, Run
-from .quota import ledger_metadata, migrate_legacy_usage, now_period, used_cases_for
+from .quota import (
+    ledger_metadata,
+    migrate_legacy_usage,
+    now_period,
+    reserve_deadline,
+    used_cases_for,
+)
 from .quota import reserve as reserve_quota
 from .ratelimit import RateLimiter
 from .secrets import KeyCipher, encrypt_api_key
@@ -320,6 +326,23 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         except ValueError as exc:
             raise HTTPException(400, str(exc))
         period = now_period()
+        # Per-account run limits (NEEDS-DOING C): a backlog of one account
+        # cannot monopolize the queue. Active = running now, queued =
+        # waiting for a worker.
+        queued = (
+            session.query(Run.id)
+            .filter(Run.account_id == account.id, Run.status == "queued")
+            .count()
+        )
+        active = (
+            session.query(Run.id)
+            .filter(Run.account_id == account.id, Run.status == "running")
+            .count()
+        )
+        if settings.max_queued_runs_per_account and queued >= settings.max_queued_runs_per_account:
+            raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, "queued run limit exceeded")
+        if settings.max_active_runs_per_account and active >= settings.max_active_runs_per_account:
+            raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, "active run limit exceeded")
         # Quota: reserve atomically against the reservation ledger. The
         # check lives inside the INSERT's WHERE clause, so concurrent
         # submissions are serialized by the database (no read-then-write
@@ -354,6 +377,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "monthly case quota exceeded",
                 headers={"Retry-After": "86400"},
             )
+        # Run-wide deadline (NEEDS-DOING C): reserved with the run so a crash
+        # or a reclaimed attempt can never reset the budget.
+        reserve_deadline(session, run_id=run.id, run_max_seconds=settings.run_max_seconds)
         # enqueue_run commits the reservation, run, and job together.
         enqueue_run(session, run.id)
         session.refresh(run)

@@ -27,6 +27,7 @@ instead of a read-then-write race.
 from __future__ import annotations
 
 import time
+from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import (
     Boolean,
@@ -198,6 +199,35 @@ MIGRATIONS = Table(
     _ledger_meta,
     Column("name", String(80), primary_key=True),
 )
+
+
+def reserve_deadline(session: Session, run_id: int, run_max_seconds: int) -> None:
+    """Reserve the run-wide deadline budget (NEEDS-DOING C).
+
+    The deadline is an ABSOLUTE expiry persisted on the run, so a crash or a
+    reclaimed attempt can never reset the budget: the remaining time is
+    always ``deadline_at - now``. The caller owns the transaction (the run,
+    its quota reservation, and the job commit together). Runs created with
+    the limit disabled (0) have no deadline and execute unbounded.
+    """
+    if not run_max_seconds:
+        return
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    session.execute(
+        update(Run)
+        .where(Run.id == run_id, Run.deadline_at.is_(None))
+        .values(deadline_at=now + timedelta(seconds=run_max_seconds))
+        .execution_options(synchronize_session=False)
+    )
+
+
+def remaining_deadline_seconds(run: Run) -> int | None:
+    """Seconds until the run's absolute deadline; None when unlimited."""
+    if run.deadline_at is None:
+        return None
+    return max(
+        0, int((run.deadline_at - datetime.now(timezone.utc).replace(tzinfo=None)).total_seconds())
+    )
 
 
 def migrate_legacy_usage(session: Session) -> None:

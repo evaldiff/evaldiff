@@ -56,3 +56,15 @@ class Settings(BaseSettings):
     # the byte cap; 0 idle timeout disables the stall detection.
     response_max_bytes: int = 16_000_000
     response_idle_timeout: float = 10.0
+
+    # Worker scheduling (NEEDS-DOING C): concurrent attempts and per-account
+    # limits so one account's backlog cannot monopolize the worker.
+    # 0 disables a limit.
+    worker_concurrency: int = 4
+    max_active_runs_per_account: int = 2
+    max_queued_runs_per_account: int = 10
+
+    # Overall wall-clock deadline for a run, spanning retries and reclaimed
+    # attempts: the budget is reserved at enqueue time and persisted on the
+    # run, so a crash cannot reset it (NEEDS-DOING C). 0 disables.
+    run_max_seconds: int = 1800
