@@ -2,15 +2,23 @@
 
 ## 0. Current status
 
-Package metadata is at **0.0.15** (live on PyPI, api.evaldiff.io, and npm
-latest). 0.0.15 ships the section A P1/P2 review fixes:
-decompression bounded *during* decode (64 KiB window), proxy observes client
-disconnect on a 0.25 s tick and releases the upstream socket, stalled upstream
-hits the idle window, proxy-violation 502s become non-retryable
-`ResponseLimitExceeded`/`ResponseStalled` (case not charged), and
-`_read_response` rewritten as a frame-aware state machine (declared-over-cap
-rejected at declaration; complete-at-cap responses preserved).
-**87/87 tests pass, ruff clean, CI green on 76ceddd.**
+Package metadata is at **0.0.16** (live on PyPI, api.evaldiff.io, and npm
+latest). 0.0.16 ships the section A decoder-hardening passes that followed the
+0.0.15 P1/P2 fixes:
+- **P1 (unbounded detection buffer)** — `_RawDeflateDecoder` format detection
+  no longer accumulates wire input in an unbounded `_acc`; it uses two
+  *stateful* zlib/raw-deflate probes fed incrementally (a valid deflate stream
+  never raises on incomplete input, so a raise is conclusive "wrong format").
+  The pre-settle buffer is bounded by a detection buffer derived from the byte
+  cap, and a sustained valid-but-zero-output stream (empty stored blocks) is
+  rejected at that bound instead of growing without limit.
+- **Trailing-data / concatenated-stream rejection** — `_decompress_single_stream`
+  guards decoding after compression EOF (a suffix in the final chunk *and* a
+  subsequent wire chunk on an already-EOF decoder) and `_settle` checks the
+  committed probe's `unused_data`. Multi-member gzip (RFC 1952 concatenated
+  members) is now rejected by design.
+**112/112 tests pass, ruff check + format clean, CI green (7 jobs), PyPI +
+Hetzner + npm all at 0.0.16.**
 
 Readiness assessment: suitable for a controlled internal pilot with trusted
 endpoints after deployment checks; **public production readiness is not yet
@@ -18,6 +26,33 @@ established**. Complete sections 3B–3D before public rollout. Section 3E is
 also required before advertising the complete CLI/CI workflow.
 
 ## 1. Release history
+
+### SHIPPED 0.0.16 (2026-10-11) — section A decoder hardening
+Closes the reviewer-found gaps that followed the 0.0.15 P1/P2 fixes
+(`b13d330` P1/P2, `191920a` unbounded-buffer fix, `6f787b8` trailing-data
+rejection, `deb64b8` version bump):
+1. **P1 — unbounded format-detection buffering.** `_RawDeflateDecoder` used to
+   accumulate wire input in `_acc` until a decoder produced output; the cap
+   counted only decoded bytes, so malformed input or valid empty-stored-blocks
+   could grow the buffer without bound (8 MiB consumed against a 2 KiB cap).
+   Now two *stateful* probes (zlib-wrapped `wbits=15` + raw `wbits=-15`) are
+   fed the new chunk only — no re-decode of the accumulated prefix, so
+   detection is linear in wire bytes. A probe that raises is dead (a valid
+   deflate stream never raises on incomplete input); a probe that reaches
+   end-of-stream commits immediately (including zero-output streams). A
+   detection buffer derived from the byte cap bounds the pre-settle buffer and
+   rejects a sustained zero-output stream.
+2. **Trailing / concatenated compressed data rejected.** New
+   `_decompress_single_stream` guards decoding after compression EOF — both a
+   suffix sharing the chunk that reaches EOF and a subsequent wire chunk on an
+   already-EOF decoder raise `ResponseLimitExceeded("…after compression
+   EOF")`. `_settle` also rejects a committed probe carrying `unused_data`.
+   Multi-member gzip (RFC 1952 concatenated members) is rejected by design —
+   accepted for model/judge API responses, where we request identity.
+**112/112 tests pass, ruff check + format clean, CI green (7 jobs incl.
+py3.10/3.11/3.12 + postgres + npm-smoke). PyPI 0.0.16 live, api.evaldiff.io
+`/health` → 0.0.16, npm `@evaldiff/evaldiff` latest → 0.0.16 (approved
+2026-10-11T18:19Z).**
 
 ### SHIPPED 0.0.9 (2026-10-02)
 - **Quota reservation race fix** (Peter's commit d9c43af, reviewed + verified):
