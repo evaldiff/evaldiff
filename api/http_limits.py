@@ -57,6 +57,7 @@ import contextlib
 import inspect
 import json
 import zlib
+from typing import Any
 
 import httpx
 
@@ -93,42 +94,105 @@ async def _aclose(response: httpx.Response) -> None:
         await response.aclose()
 
 
-class _RawDeflateDecoder:
-    """Deflate, whose wire form is ambiguous (zlib-wrapped vs raw stream).
+class _ZlibDecoder:
+    """A zlib-family stream (gzip or zlib-wrapped) with the uniform
+    bounded-decoding protocol: ``decompress(data, max_out)`` + ``residual``
+    (input passed in but not yet decoded — the caller must feed it back)."""
 
-    Try the zlib-wrapped interpretation first; if it fails *before any
-    output has been committed*, restart from the beginning as a raw
-    deflate stream. Once either interpretation has produced output, a
-    failure is a genuinely malformed stream — raise.
+    def __init__(self, wbits: int) -> None:
+        self._d = zlib.decompressobj(wbits)
+
+    def decompress(self, data: bytes, max_out: int) -> bytes:
+        return self._d.decompress(data, max_out)
+
+    @property
+    def residual(self) -> bytes:
+        return self._d.unconsumed_tail
+
+    def flush(self) -> bytes:
+        return self._d.flush()
+
+
+class _RawDeflateDecoder:
+    """``Content-Encoding: deflate``, whose wire form is ambiguous
+    (zlib-wrapped vs raw deflate stream).
+
+    The format can only be settled from the bytes themselves, and it must
+    not depend on where the network chunk boundaries fall. So while the
+    format is unsettled we **accumulate** the wire input and, on each call,
+    re-try both interpretations on the whole accumulated buffer:
+
+    - zlib-wrapped first (``wbits=15``);
+    - then raw deflate (``wbits=-15``).
+
+    Whichever interpretation actually *yields output* wins and is
+    committed; from then on the committed stateful decoder is used
+    directly and ``residual`` (its ``unconsumed_tail``) drives the window
+    loop in ``_accept_chunk``.
+
+    Crucially, a ``zlib.error`` on a prefix does **not** commit the other
+    format: a mid-block prefix of a *valid* zlib-wrapped stream can raise
+    ("invalid stored block lengths") while a longer prefix decodes fine.
+    We only ever commit on positive output, so the format is established
+    by evidence, not by a failed guess. A genuinely malformed stream is
+    reported by ``flush`` at end-of-stream, once the whole body has
+    accumulated and both interpretations have had their chance.
     """
 
     def __init__(self) -> None:
-        self._zlib = zlib.decompressobj()  # zlib wrapper
-        self._raw = zlib.decompressobj(-zlib.MAX_WBITS)  # raw deflate
-        self._using_raw = False
         self._committed = False
+        self._active: Any = None  # a zlib.decompressobj once committed
+        self._acc = b""  # wire input held while the format is unsettled
 
     def decompress(self, data: bytes, max_out: int) -> bytes:
-        if not self._using_raw:
+        if self._committed:
+            assert self._active is not None
+            return self._active.decompress(data, max_out)
+        self._acc += data
+        # Settle the format on the accumulated buffer: the first
+        # interpretation that yields output wins.
+        for wbits in (15, -zlib.MAX_WBITS):
             try:
-                out = self._zlib.decompress(data, max_out)
-                self._committed = True
-                return out
+                d = zlib.decompressobj(wbits)
+                out = d.decompress(self._acc, max_out)
             except zlib.error:
-                if self._committed:
-                    raise
-                self._raw = zlib.decompressobj(-zlib.MAX_WBITS)
-                self._using_raw = True
-                # Re-feed this chunk to the raw stream.
-                out = self._raw.decompress(data, max_out)
+                continue
+            if out:
+                self._active = d
                 self._committed = True
+                self._acc = b""
                 return out
-        out = self._raw.decompress(data, max_out)
-        self._committed = True
-        return out
+        # Incomplete stream — neither interpretation produced output yet.
+        # Keep the buffer; wait for more wire data.
+        return b""
+
+    @property
+    def residual(self) -> bytes:
+        if self._committed:
+            assert self._active is not None
+            return self._active.unconsumed_tail
+        return b""  # accumulating: nothing to feed back yet
 
     def flush(self) -> bytes:
-        return (self._raw if self._using_raw else self._zlib).flush()
+        if self._committed:
+            assert self._active is not None
+            return self._active.flush()
+        if not self._acc:
+            return b""  # empty body: nothing to settle
+        # End-of-stream arrived before the format settled: give both
+        # interpretations a final shot at the complete buffer.
+        for wbits in (15, -zlib.MAX_WBITS):
+            try:
+                d = zlib.decompressobj(wbits)
+                out = d.decompress(self._acc)
+            except zlib.error:
+                continue
+            self._active = d
+            self._committed = True
+            self._acc = b""
+            return out + d.flush()
+        # Neither format could decode the body — malformed.
+        raise zlib.error("deflate body could not be decoded as zlib or raw deflate")
 
 
 class _BrotliDecoder:
@@ -161,7 +225,7 @@ def _decoder_for(encoding: str):
         return None
     if enc == "gzip":
         # wbits=47 auto-detects the gzip wrapper (and plain zlib streams).
-        return zlib.decompressobj(47)
+        return _ZlibDecoder(47)
     if enc == "deflate":
         return _RawDeflateDecoder()
     if enc == "br":
@@ -170,25 +234,47 @@ def _decoder_for(encoding: str):
 
 
 def _accept_chunk(chunk: bytes, *, decoder, out: bytearray, max_bytes: int) -> None:
-    """Accept one wire chunk: decode within the window, enforce the cap."""
+    """Accept one wire chunk: decode within the window, enforce the cap.
+
+    After a windowed ``decompress`` call the decoder may still hold
+    *undecoded* input (zlib exposes it as ``unconsumed_tail``; this module
+    normalizes it under ``decoder.residual``). That input must be fed back
+    through bounded decoding until the decoder reports nothing more to
+    give — CPython's incremental decoder does not reliably keep draining
+    on empty feeds after a ``max_length``-bounded call (feeding ``b""``
+    discards most of the held input and silently truncates the body).
+    A call that produces no output and leaves the same input held is a
+    no-progress stop (incomplete stream) — ``flush`` at end-of-stream is
+    what turns that into an error.
+    """
     if decoder is None:
-        piece = chunk
-    else:
-        piece = b""
-        while True:
-            more = decoder.decompress(chunk if not piece else b"", _DECOMPRESSION_WINDOW)
-            piece += more
-            if max_bytes > 0 and len(out) + len(piece) > max_bytes:
-                raise ResponseLimitExceeded(
-                    f"body exceeds limit: {max_bytes} bytes (received {len(out) + len(piece)})"
-                )
-            if not more:
-                break
+        _check_cap(out, chunk, max_bytes)
+        out += chunk
+        return
+    piece = b""
+    feed = chunk
+    while True:
+        more = decoder.decompress(feed, _DECOMPRESSION_WINDOW)
+        piece += more
+        _check_cap(out, piece, max_bytes)
+        if more:
+            # Window filled: keep draining the decoder's held (undecoded)
+            # input within the window.
+            feed = getattr(decoder, "residual", b"") or b""
+            continue
+        tail = getattr(decoder, "residual", b"")
+        if tail and tail != feed:
+            feed = tail  # the decoder still has undecoded input — feed it back
+            continue
+        break
+    out += piece
+
+
+def _check_cap(out: bytearray, piece: bytes, max_bytes: int) -> None:
     if max_bytes > 0 and len(out) + len(piece) > max_bytes:
         raise ResponseLimitExceeded(
             f"body exceeds limit: {max_bytes} bytes (received {len(out) + len(piece)})"
         )
-    out += piece
 
 
 async def read_capped_body(response: httpx.Response, *, max_bytes: int) -> bytes:
