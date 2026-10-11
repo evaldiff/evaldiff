@@ -1,0 +1,11 @@
+# Only package inputs enter the build context; exclude secrets and databases.
+*
+!pyproject.toml
+!README.md
+!LICENSE
+!api/
+!api/**
+!evaldiff_cli/
+!evaldiff_cli/**
+**/__pycache__
+**/*.pyc

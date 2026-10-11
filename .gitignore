@@ -7,3 +7,11 @@ build/
 node_modules/
 *.tgz
 npm/.npmrc
+
+# Local credentials, databases, and recovery artifacts
+.env
+.env.*
+encryption.env
+*.dump
+*.backup
+*.db
