@@ -171,10 +171,11 @@ async def _execute_cases(run: Run, session: Session, cases: list, protect, attem
                     if remaining is not None:
                         # The deadline covers the WHOLE case — model call,
                         # retries, judge, and the result write to storage.
-                        # wait_for cancels the case task on expiry and waits
-                        # for the cancellation to complete; a slow storage
-                        # backend cannot outlive the deadline (P1 fix) and,
-                        # running off-thread, cannot block heartbeats.
+                        # wait_for cancels an in-flight model/judge call on
+                        # expiry; the storage write runs off-thread (so a
+                        # slow backend cannot block heartbeats) and is
+                        # charged only if the budget is still alive when it
+                        # lands (P1 fix).
                         _output, t_in, t_out, score, output_key = await asyncio.wait_for(
                             _execute_case(
                                 run,
