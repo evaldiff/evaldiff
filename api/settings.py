@@ -70,17 +70,16 @@ class Settings(BaseSettings):
     run_max_seconds: int = 1800
 
     # Bounded pool for synchronous storage (S3/SeaweedFS) calls (NEEDS-DOING
-    # C): a stalled call occupies a thread until the client's transport
-    # timeout and cannot be cancelled — the pool caps the number of live
-    # threads a stall can pin, and the deadline guard fires while extra
-    # calls wait in the queue. 1 (or below) forces a single thread.
+    # C): a stalled call cannot be cancelled; the pool caps live threads,
+    # and the admission gate keeps waiting calls out of its work queue.
+    # 1 (or below) forces a single thread.
     max_storage_threads: int = 4
 
-    # Finite TOTAL lifetime for the underlying storage calls themselves
-    # (NEEDS-DOING C): a per-call budget in api.runner, on top of the
+    # Maximum caller wait for storage calls (NEEDS-DOING C): a per-call
+    # event-loop timer in api.runner, on top of the
     # transport's connect/read timeouts — which only bound the time
     # BETWEEN socket reads (botocore's default read_timeout is 60 s),
-    # not the time to finish the response. Without the per-call budget
-    # a slow-drip peer pins its pool thread (and admission slot) for
-    # the life of the process, and delays shutdown. 0 disables.
+    # not the time to finish the response. The caller can stop waiting
+    # at this budget, but an in-flight synchronous call keeps its pool
+    # thread and admission slot until it actually finishes. 0 disables.
     storage_timeout: float = 15.0

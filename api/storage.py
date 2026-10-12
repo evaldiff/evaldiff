@@ -54,8 +54,8 @@ class S3Storage(Storage):
         # botocore defaults to 60 s for BOTH connect and read, and a
         # read timeout measures the time BETWEEN socket reads — a peer
         # that keeps sending data slowly can still outlive it, so the
-        # authoritative total-lifetime bound is the per-call budget in
-        # api.runner (storage_timeout). A timed-out call raises
+        # caller's wait is bounded in api.runner, though the synchronous
+        # call can continue after that wait expires. A timed-out call raises
         # (ClientError/ReadTimeoutError) and is treated as a failed
         # storage operation — the bounded pool + process-wide admission
         # gate (api.runner) cap the damage a stall can do.

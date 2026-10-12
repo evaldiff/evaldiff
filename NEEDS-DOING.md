@@ -217,13 +217,13 @@ Synchronous storage calls run off the event loop on a bounded
 `ThreadPoolExecutor` (`max_storage_threads`) behind a PROCESS-WIDE admission
 gate (`api.runner.AsyncGate`) acquired before `pool.submit`, so timed-out
 waiters never enter the executor's unbounded queue — the gate is shared by
-every event loop in the process, closing the per-loop admission leak. Every
-admitted call gets a TOTAL lifetime budget (`_call_with_lifetime` + a daemon
-watchdog; caller unblocks at budget even if the work thread is still inside
-the call) on top of botocore's connect/read transport timeouts
-(`storage_timeout` — a read timeout is per-socket-read, so a dribbling peer
-cannot hold the call past the budget). The gate slot is released exactly once,
-on the worker thread, when the work actually finishes.
+every event loop in the process, closing the per-loop admission leak. The
+caller's wait has a total budget enforced by an event-loop timer, which is
+cancelled when the call finishes. Botocore's connect/read timeouts are
+per-operation/socket-read limits; a synchronous call can outlive the caller's
+budget. The gate slot is released exactly once, on the worker thread, when
+the work actually finishes. A release signals every parked waiter so a
+cancelled waiter cannot strand a free slot.
 Validation (round 5): full suite passes on SQLite AND PostgreSQL
 (`EVALDIFF_TEST_POSTGRES_URL`, PG 18 local: **173 passed, 1 skipped**);
 dedicated regression tests pin the user-reported repros: 100 timed-out
@@ -233,6 +233,18 @@ dataset read fails+refunds at the deadline, a slow write is discarded (case
 not charged), and a 4s call with a 1.2s TOTAL budget unblocks the caller at
 the budget (not 4s) with the worker thread abandoned in place. ruff check +
 format clean.
+
+Remaining Part C limitation (open): the deadline and `storage_timeout` stop
+the caller waiting for an S3 operation, but cannot cancel a synchronous boto3
+call already running in a `ThreadPoolExecutor` thread. That thread keeps its
+admission slot until the call returns. A peer that sends response bytes slowly
+can evade per-read socket timeouts; if all storage threads remain occupied,
+later storage calls wait and process shutdown can hang. The bounded pool and
+gate limit concurrent damage but do not satisfy the resource-release and
+graceful-shutdown acceptance criteria above. Resolve this with storage I/O that
+can be aborted under a total operation deadline, or isolate calls in workers
+that can be terminated; test a slow-drip S3 response and shutdown with every
+storage slot occupied before considering Part C complete.
 
 ### D. Verify the production stack and prepare operations
 

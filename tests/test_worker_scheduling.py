@@ -869,15 +869,53 @@ def test_cross_loop_admission_still_bounded(sessions, monkeypatch):
     assert queued == 0, f"{queued} work items queued across 20 loops"
 
 
+def test_cancelled_gate_waiter_does_not_strand_free_slot():
+    """A waiter cancelled after release schedules its wake must not leave
+    another waiter asleep while the gate has a free slot."""
+    from api.runner import AsyncGate
+
+    async def drive():
+        gate = AsyncGate(1)
+        await gate.acquire()
+        first = asyncio.create_task(gate.acquire())
+        second = asyncio.create_task(gate.acquire())
+        await asyncio.sleep(0)  # both waiters are parked
+
+        gate.release()  # schedules wakes, which have not run yet
+        first.cancel()
+        await asyncio.gather(first, return_exceptions=True)
+        await asyncio.wait_for(second, timeout=0.5)
+        assert gate.free == 0
+        gate.release()
+        assert gate.free == 1
+
+    asyncio.run(drive())
+
+
+def test_completed_storage_calls_leave_no_watchdog_threads(sessions, monkeypatch):
+    """Fast calls must cancel their deadline timers immediately instead
+    of leaving one sleeping watchdog thread per completed call."""
+    import api.runner as runner_module
+
+    monkeypatch.setattr(runner_module, "_pool", None)
+    monkeypatch.setattr(runner_module, "_gate", None)
+    before = sum(t.name == "evaldiff-storage-wd" for t in threading.enumerate())
+
+    async def drive():
+        for _ in range(100):
+            assert await runner_module._storage_call(lambda: "ok", timeout=5) == "ok"
+
+    asyncio.run(drive())
+    after = sum(t.name == "evaldiff-storage-wd" for t in threading.enumerate())
+    assert after <= before, f"{after - before} watchdog threads survived completed calls"
+
+
 def test_storage_call_lifetime_budget_bounds_total(sessions, monkeypatch):
-    """P1: a storage call's TOTAL lifetime is bounded, not just the time
-    BETWEEN socket reads (botocore's read_timeout is a per-read value —
-    a peer dribbling bytes can outlive it, and a plain to_thread wait
-    would block the caller for the whole worker lifetime). A call whose
-    worker sleeps 4s with a 1.2s TOTAL budget must unblock the caller at
-    ~the budget — NOT at 4s — surface a TimeoutError (so deadline guards
-    treat it exactly like a deadline lapse: discarded, not charged), and
-    leave the worker thread abandoned in place (not killed, not joined)."""
+    """P1: the caller's total wait is bounded, not just the time BETWEEN
+    socket reads (botocore's read_timeout is per-read). A worker that
+    sleeps 4s with a 1.2s wait budget must unblock its caller at the
+    budget, surface a TimeoutError, and leave the synchronous operation
+    running in its pool thread until it actually finishes."""
     import api.runner as runner_module
 
     monkeypatch.setattr(runner_module, "_pool", None)
