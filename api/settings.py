@@ -68,3 +68,10 @@ class Settings(BaseSettings):
     # attempts: the budget is reserved at enqueue time and persisted on the
     # run, so a crash cannot reset it (NEEDS-DOING C). 0 disables.
     run_max_seconds: int = 1800
+
+    # Bounded pool for synchronous storage (S3/SeaweedFS) calls (NEEDS-DOING
+    # C): a stalled call occupies a thread until the client's transport
+    # timeout and cannot be cancelled — the pool caps the number of live
+    # threads a stall can pin, and the deadline guard fires while extra
+    # calls wait in the queue. 1 (or below) forces a single thread.
+    max_storage_threads: int = 4

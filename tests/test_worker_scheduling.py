@@ -489,20 +489,33 @@ def test_backlog_account_cannot_monopolize_slots(sessions):
 def test_deadline_covers_storage_write(sessions, monkeypatch):
     """P1: the deadline covers the case's result write to storage, not
     just the model call. A storage backend that finishes AFTER the
-    deadline must not charge the case or mark the run done — and the
-    write runs off the event loop, so it cannot stall lease heartbeats
-    while it blocks."""
+    deadline must not charge the case or mark the run done.
+
+    P2 (bounded pool): the write must NOT be awaited to completion — a
+    stalled write keeps running in its (bounded) pool thread while the
+    run settles at the deadline. The previous version of this test
+    asserted ``elapsed >= 2.8``, which ``asyncio.run``'s executor
+    teardown made pass even when the run awaited the slow write:
+    asyncio.run() joins the loop's executor threads during teardown,
+    so the clock always included the 3s stall. The assertion that
+    catches the real bug is the opposite bound: the run finishes at the
+    deadline (elapsed < the write's 3s), with the slow thread still
+    alive — proving the run did NOT wait for it.
+    """
     aid, rid = seed(sessions, count=1, deadline=2)
 
     class SlowStorage(InMemoryStorage):
         started = threading.Event()
+        finished = threading.Event()
 
         def put_json(self, key: str, obj: object) -> str:
             self.started.set()
-            # Hold the write until well past the 2s deadline (then finish,
+            # Hold the write well past the 2s deadline (then finish,
             # like a slow backend that completes late).
             time.sleep(3)
-            return super().put_json(key, obj)
+            out = super().put_json(key, obj)
+            self.finished.set()
+            return out
 
     slow = SlowStorage()
     monkeypatch.setattr(state, "storage", slow)
@@ -518,12 +531,178 @@ def test_deadline_covers_storage_write(sessions, monkeypatch):
         assert session.query(RunCase).count() == 0  # case not charged
         assert used_cases_for(aid, now_period(), session) == 0  # full refund
     assert SlowStorage.started.is_set()  # the storage write was actually entered
-    # The run failed AFTER the (slow) write landed — the late write counts
-    # for nothing: the case is not charged and the run is not marked done.
-    assert elapsed >= 2.8, f"storage write was not awaited to completion (elapsed={elapsed:.2f}s)"
+    # P1: the run settled at the deadline, BEFORE the 3s write landed.
+    assert elapsed < 2.9, (
+        f"run awaited the slow storage write (elapsed={elapsed:.2f}s) — the deadline "
+        "must settle the run at 2s while the write finishes in its pool thread"
+    )
+    # P2: the stalled write is still running in its thread (not awaited,
+    # not killed — it finishes later, discarded, and occupies at most one
+    # of the bounded pool's threads).
+    assert slow.started.is_set() and not slow.finished.is_set()
 
 
-@pytest.mark.skipif(not os.environ.get("EVALDIFF_TEST_POSTGRES_URL"), reason="requires PostgreSQL")
+def seed_storage_dataset(sessions, *, deadline: int | None = None):
+    """Account + STORAGE-based dataset (cases in object storage, not inline)
+    + queued run + quota reservation. Returns (account_id, run_id)."""
+    with sessions() as session:
+        account = Account(email=uuid.uuid4().hex + "@example.com", quota_period=now_period())
+        dataset = Dataset(
+            account=account,
+            name="d",
+            case_count=1,
+            storage_key=f"datasets/{uuid.uuid4().hex}",
+            cases_json=None,
+        )
+        run = Run(
+            account=account,
+            dataset=dataset,
+            model="m",
+            endpoint="https://example.com",
+            total_cases=1,
+            status="queued",
+        )
+        session.add(run)
+        session.flush()
+        reserve(
+            session,
+            run_id=run.id,
+            account_id=account.id,
+            case_count=1,
+            period=now_period(),
+            quota=10_000,
+        )
+        if deadline is not None:
+            reserve_deadline(session, run.id, deadline)
+        enqueue_run(session, run.id)
+        return account.id, run.id
+
+
+def test_stalled_dataset_read_fails_run(sessions, monkeypatch):
+    """P1: the deadline covers the DATASET READ (before the first case),
+    not just case work. A stalled S3 read must fail the run — settling
+    quota and freeing the worker slot at the deadline — instead of
+    holding the slot and the reservation until the client's transport
+    timeout. As with the write test, the real assertion is the OPPOSITE
+    bound: the run settles at the deadline (elapsed < the read's stall),
+    with the slow thread still alive (proving it was not awaited;
+    asyncio.run's executor join would have masked an awaited read)."""
+    aid, rid = seed_storage_dataset(sessions, deadline=2)
+
+    class StalledRead(InMemoryStorage):
+        started = threading.Event()
+        finished = threading.Event()
+
+        def get_json(self, key: str) -> object:
+            self.started.set()
+            time.sleep(3)  # well past the 2s deadline
+            out = super().get_json(key)
+            self.finished.set()
+            return out
+
+    stalled = StalledRead()
+    monkeypatch.setattr(state, "storage", stalled)
+    monkeypatch.setattr("api.runner.call_model", fake_model(sessions))
+    jid, token = claim(sessions, rid)
+    started_at = time.monotonic()
+    asyncio.run(asyncio.wait_for(execute_run(rid, job_id=jid, lease_token=token), timeout=15))
+    elapsed = time.monotonic() - started_at
+    with sessions() as session:
+        run = session.get(Run, rid)
+        assert run.status == "failed"  # NOT left running — slot freed, quota settled
+        assert "deadline" in (run.error or "").lower()
+        assert session.query(RunCase).count() == 0  # nothing was executed, nothing charged
+        assert used_cases_for(aid, now_period(), session) == 0  # full refund
+        job = session.query(Job).first()
+        assert job.status == "running"  # the JOB is finalized by the worker; the run is settled
+    assert StalledRead.started.is_set()  # the read was actually entered
+    # The run settled at the 2s deadline, while the 3s read kept running.
+    assert elapsed < 2.9, (
+        f"run awaited the stalled dataset read (elapsed={elapsed:.2f}s) — the "
+        "deadline must settle the run at 2s, not at the read's completion"
+    )
+    assert stalled.started.is_set() and not stalled.finished.is_set()
+
+
+def test_stalled_writes_cannot_exhaust_pool(sessions, monkeypatch):
+    """P2: repeated stalled writes must not consume an unbounded number
+    of threads. With a pool of ONE storage thread, two concurrent runs
+    whose writes each stall for 2.5s cannot run their writes in parallel
+    — the second waits in the queue (where the deadline guard can still
+    cancel it), so at most ONE write thread is ever live. An unbounded
+    pool (asyncio.to_thread) would have two live threads at once.
+
+    Also pins the deadline semantics for the queued case: the run whose
+    write could not get a thread before its budget ran out is failed and
+    refunded, not charged."""
+    # One storage thread + no pool yet (other tests may have created one).
+    import api.runner as runner_module
+
+    monkeypatch.setattr(runner_module, "_pool", None)
+    monkeypatch.setattr(state, "settings", Settings(max_storage_threads=1))
+
+    live = 0
+    peak = 0
+    lock = threading.Lock()
+
+    class BoundedStorage(InMemoryStorage):
+        def _track(self, fn):
+            nonlocal live, peak
+            with lock:
+                live += 1
+                peak = max(peak, live)
+            try:
+                return fn()
+            finally:
+                with lock:
+                    live -= 1
+
+        def get_json(self, key: str) -> object:
+            def _get():
+                time.sleep(1.5)
+                return [{"input": "x", "expected": "x"}]
+
+            return self._track(_get)
+
+        def put_json(self, key: str, obj: object) -> str:
+            def _put():
+                time.sleep(2.5)  # longer than the budget left for the queued run
+                return key
+
+            return self._track(_put)
+
+    storage = BoundedStorage()
+    monkeypatch.setattr(state, "storage", storage)
+    monkeypatch.setattr("api.runner.call_model", fake_model(sessions))
+
+    aid_a, rid_a = seed_storage_dataset(sessions, deadline=6)
+    aid_b, rid_b = seed_storage_dataset(sessions, deadline=6)
+
+    async def drive():
+        a = asyncio.wait_for(execute_run(rid_a), timeout=20)
+        b = asyncio.wait_for(execute_run(rid_b), timeout=20)
+        return await asyncio.gather(a, b, return_exceptions=True)
+
+    asyncio.run(drive())
+
+    with sessions() as session:
+        run_a = session.get(Run, rid_a)
+        run_b = session.get(Run, rid_b)
+        statuses = sorted([run_a.status, run_b.status])
+        # With one thread and a 2.5s write, exactly one run can finish its
+        # write inside its 6s budget; the other is failed + refunded.
+        assert statuses == ["done", "failed"], f"expected one done + one failed, got {statuses}"
+        for aid, run in ((aid_a, run_a), (aid_b, run_b)):
+            if run.status == "failed":
+                assert "deadline" in (run.error or "").lower()
+                assert used_cases_for(aid, now_period(), session) == 0  # refunded
+            else:
+                assert session.query(RunCase).filter(RunCase.run_id == run.id).count() == 1
+    # The core P2 assertion: the writes never ran in parallel — the pool
+    # capped live storage threads at 1. (An unbounded pool: peak == 2.)
+    assert peak <= 1, f"storage pool was not bounded: {peak} concurrent storage threads"
+
+
 def test_account_cap_atomic_across_workers(sessions):
     """P2: the per-account cap must be atomic across concurrent workers.
     Two workers claiming the SAME account's two pending jobs at the SAME
