@@ -208,6 +208,32 @@ settles exactly once. Another account's fast run completes while the slow run
 is active. Concurrent workers never duplicate committed case results; shutdown
 and lease expiry recover work without stale writes or abandoned reservations.
 
+Implementation (2026-10-12, rounds 1–5): `deadline_at` (absolute UTC) is
+persisted on `Run` and settled once via the reservation ledger; in-flight
+cases, the dataset read, and storage writes all run under the deadline
+(`RunDeadlineExceeded` → failed + refund). Worker concurrency and per-account
+active/queued caps use an atomic under-lock claim (`poll_once` + `lock_account`).
+Synchronous storage calls run off the event loop on a bounded
+`ThreadPoolExecutor` (`max_storage_threads`) behind a PROCESS-WIDE admission
+gate (`api.runner.AsyncGate`) acquired before `pool.submit`, so timed-out
+waiters never enter the executor's unbounded queue — the gate is shared by
+every event loop in the process, closing the per-loop admission leak. Every
+admitted call gets a TOTAL lifetime budget (`_call_with_lifetime` + a daemon
+watchdog; caller unblocks at budget even if the work thread is still inside
+the call) on top of botocore's connect/read transport timeouts
+(`storage_timeout` — a read timeout is per-socket-read, so a dribbling peer
+cannot hold the call past the budget). The gate slot is released exactly once,
+on the worker thread, when the work actually finishes.
+Validation (round 5): full suite passes on SQLite AND PostgreSQL
+(`EVALDIFF_TEST_POSTGRES_URL`, PG 18 local: **173 passed, 1 skipped**);
+dedicated regression tests pin the user-reported repros: 100 timed-out
+submissions leave 0 executor-queue items, 20 successive event loops behind
+one blocked thread leave 0 queued items and no phantom gate slots, a stalled
+dataset read fails+refunds at the deadline, a slow write is discarded (case
+not charged), and a 4s call with a 1.2s TOTAL budget unblocks the caller at
+the budget (not 4s) with the worker thread abandoned in place. ruff check +
+format clean.
+
 ### D. Verify the production stack and prepare operations
 
 Files: `.github/workflows/ci.yml`, `tests/test_recovery_quota.py`, `deploy/`.

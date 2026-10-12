@@ -50,12 +50,15 @@ class S3Storage(Storage):
         import boto3
         from botocore.config import Config
 
-        # Finite lifetime for every S3 call (NEEDS-DOING C): botocore's
-        # default read timeout is unbounded, so a stalled connection would
-        # pin its pool thread for the life of the process. A timed-out
-        # call raises (ClientError/ReadTimeoutError) and is treated as a
-        # failed storage operation — the bounded pool + admission
-        # semaphore (api.runner) cap the damage a stall can do.
+        # Transport-level timeouts for the S3 client (NEEDS-DOING C):
+        # botocore defaults to 60 s for BOTH connect and read, and a
+        # read timeout measures the time BETWEEN socket reads — a peer
+        # that keeps sending data slowly can still outlive it, so the
+        # authoritative total-lifetime bound is the per-call budget in
+        # api.runner (storage_timeout). A timed-out call raises
+        # (ClientError/ReadTimeoutError) and is treated as a failed
+        # storage operation — the bounded pool + process-wide admission
+        # gate (api.runner) cap the damage a stall can do.
         kwargs = {"signature_version": "s3v4"}
         if timeout and timeout > 0:
             kwargs.update(connect_timeout=timeout, read_timeout=timeout)

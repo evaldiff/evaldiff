@@ -504,6 +504,18 @@ def test_deadline_covers_storage_write(sessions, monkeypatch):
     """
     aid, rid = seed(sessions, count=1, deadline=2)
 
+    # Isolated fresh pool for this test: the admission/saturation tests
+    # leave threads parked in blocker.wait() for ~10s, and they share
+    # this pool (default 4 threads). A write delayed behind them would
+    # change the deadline-vs-write timing this test pins. A fresh, empty
+    # pool makes the write start immediately so the deadline (2s) lapses
+    # deterministically before the 3s write lands.
+    import api.runner as runner_module
+
+    monkeypatch.setattr(runner_module, "_pool", None)
+    monkeypatch.setattr(runner_module, "_gate", None)
+    monkeypatch.setattr(state, "settings", Settings(max_storage_threads=1))
+
     class SlowStorage(InMemoryStorage):
         started = threading.Event()
         finished = threading.Event()
@@ -635,10 +647,12 @@ def test_stalled_writes_cannot_exhaust_pool(sessions, monkeypatch):
     Also pins the deadline semantics for the queued case: the run whose
     write could not get a slot before its budget ran out is failed and
     refunded, not charged."""
-    # One storage thread + no pool yet (other tests may have created one).
+    # One storage thread + fresh pool/gate (other tests may have created
+    # their own).
     import api.runner as runner_module
 
     monkeypatch.setattr(runner_module, "_pool", None)
+    monkeypatch.setattr(runner_module, "_gate", None)
     monkeypatch.setattr(state, "settings", Settings(max_storage_threads=1))
 
     live = 0
@@ -675,6 +689,10 @@ def test_stalled_writes_cannot_exhaust_pool(sessions, monkeypatch):
     monkeypatch.setattr(state, "storage", storage)
     monkeypatch.setattr("api.runner.call_model", fake_model(sessions))
 
+    # deadline=6: run A's 1.5s read + 2.5s write land inside its budget;
+    # run B is serialised behind A on the single pool thread, so its
+    # write starts after A's and lands past its own deadline — failed +
+    # refunded. (Both exceed a 3s budget, so 6 is the tight working value.)
     aid_a, rid_a = seed_storage_dataset(sessions, deadline=6)
     aid_b, rid_b = seed_storage_dataset(sessions, deadline=6)
 
@@ -714,6 +732,8 @@ def test_timed_out_submissions_do_not_enter_queue(sessions, monkeypatch):
     import api.runner as runner_module
 
     monkeypatch.setattr(runner_module, "_pool", None)
+    monkeypatch.setattr(runner_module, "_gate", None)
+    monkeypatch.setattr(runner_module, "_pool_size", 1)
     monkeypatch.setattr(state, "settings", Settings(max_storage_threads=1))
 
     blocker = threading.Event()
@@ -725,8 +745,7 @@ def test_timed_out_submissions_do_not_enter_queue(sessions, monkeypatch):
         return "ok"
 
     async def drive():
-        loop = asyncio.get_running_loop()
-        pool, _sem = runner_module._storage_pool(loop)
+        pool, _gate = runner_module._storage_pool()
 
         async def _wait_threaded(event: threading.Event, seconds: float = 10.0) -> None:
             deadline = time.monotonic() + seconds
@@ -753,6 +772,144 @@ def test_timed_out_submissions_do_not_enter_queue(sessions, monkeypatch):
     # The 100 timed-out submissions left ZERO work items in the executor
     # queue — they were rejected at admission, before pool.submit.
     assert queued == 0, f"{queued} work items queued behind the blocked thread"
+
+
+def test_cross_loop_admission_still_bounded(sessions, monkeypatch):
+    """P2 (cross-loop admission, the reported leak): admission must be
+    PROCESS-WIDE, not per event loop — the pool is process-wide, so a
+    per-loop semaphore reopens the queue-growth path when a new loop
+    appears in the same process (e.g. loop restarts in tests or a
+    worker re-spawning an executor).
+
+    Reproduction the user verified: one blocked call occupies the
+    single storage thread, then 20 successive event loops each attempt
+    a submission. With a per-loop semaphore each loop sees a fresh full
+    capacity and submits — 20 cancelled work items pile up behind the
+    blocked thread and the queue grows without bound.
+
+    With a process-wide gate, the 2nd..20th loops have zero free slots
+    and are rejected at admission BEFORE pool.submit: no work items are
+    ever enqueued from any of them, and the gate stays consistent
+    (free == 0 while the blocked call is in flight, no phantom slots)
+    across all 20 loops.
+    """
+    import api.runner as runner_module
+
+    monkeypatch.setattr(runner_module, "_pool", None)
+    monkeypatch.setattr(runner_module, "_gate", None)
+    monkeypatch.setattr(state, "settings", Settings(max_storage_threads=1))
+
+    blocker = threading.Event()
+    entered = threading.Event()
+
+    def blocked():
+        entered.set()
+        blocker.wait(10)
+        return "ok"
+
+    def submit_blocked():
+        # One loop: submit the single in-flight blocked call and hold it.
+        async def inner():
+            t = asyncio.create_task(runner_module._storage_call(blocked, timeout=60))
+            # Wait until the call is REALLY in the pool (entered), so the
+            # main thread can rely on the slot being occupied.
+            deadline = time.monotonic() + 10
+            while not entered.is_set() and time.monotonic() < deadline:
+                await asyncio.sleep(0.02)
+            await t
+
+        return asyncio.run(inner())
+
+    def submit_waiter(timeout_s: float):
+        # One loop: attempt a fast (non-blocking) storage call that
+        # should be rejected at admission (zero free slots).
+        async def inner():
+            try:
+                await asyncio.wait_for(
+                    runner_module._storage_call(lambda: "x"),
+                    timeout=timeout_s,
+                )
+                return "admitted"
+            except asyncio.TimeoutError:
+                return "timeout"
+
+        return asyncio.run(inner())
+
+    # Loop 1: the blocked call occupies the single slot.
+    t = threading.Thread(target=submit_blocked, daemon=True)
+    t.start()
+    # Deterministic readiness: wait for the blocked call to be RUNNING in
+    # the pool before spawning waiters (no startup race between the two
+    # threads — a previous version raced and let the first waiter in).
+    assert entered.wait(timeout=10), "blocked call never started in the pool"
+
+    # Loops 2..21: 20 successive loops each attempt a submission.
+    # Each times out at admission (zero free slots) — none enqueues.
+    for _ in range(20):
+        assert submit_waiter(0.3) == "timeout", (
+            "a waiter was admitted while the pool was stalled — admission is not process-wide"
+        )
+
+    pool, gate = runner_module._storage_pool()
+    # The blocked thread is still running (blocker not yet set): the
+    # single slot is held, so free == 0 (not 20 phantom slots leaked
+    # by per-loop admission).
+    assert gate.free == 0, f"gate leaked {gate.free} phantom slots across loops"
+    assert len(gate._waiters) == 0, f"{len(gate._waiters)} waiters parked"
+    # The 20 timed-out loops left ZERO work items behind the blocked
+    # thread — the queue did not grow.
+    queued = pool._work_queue.qsize()
+    blocker.set()
+    t.join(timeout=15)
+    # Give the release a moment to fire on the pool thread.
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline and gate.free != 1:
+        time.sleep(0.01)
+    assert gate.free == 1, f"gate did not recover after blocked call finished (free={gate.free})"
+    assert queued == 0, f"{queued} work items queued across 20 loops"
+
+
+def test_storage_call_lifetime_budget_bounds_total(sessions, monkeypatch):
+    """P1: a storage call's TOTAL lifetime is bounded, not just the time
+    BETWEEN socket reads (botocore's read_timeout is a per-read value —
+    a peer dribbling bytes can outlive it, and a plain to_thread wait
+    would block the caller for the whole worker lifetime). A call whose
+    worker sleeps 4s with a 1.2s TOTAL budget must unblock the caller at
+    ~the budget — NOT at 4s — surface a TimeoutError (so deadline guards
+    treat it exactly like a deadline lapse: discarded, not charged), and
+    leave the worker thread abandoned in place (not killed, not joined)."""
+    import api.runner as runner_module
+
+    monkeypatch.setattr(runner_module, "_pool", None)
+    monkeypatch.setattr(runner_module, "_gate", None)
+    monkeypatch.setattr(state, "settings", Settings(max_storage_threads=1))
+
+    slow_worker = {}
+
+    def slow():
+        slow_worker["name"] = threading.current_thread().name
+        time.sleep(4)  # well past the 1.2s TOTAL budget
+        return "late"
+
+    async def drive():
+        started = time.monotonic()
+        try:
+            await asyncio.wait_for(runner_module._storage_call(slow, timeout=1.2), timeout=3.0)
+            raise AssertionError("the 4s call should have been cut at its budget")
+        except asyncio.TimeoutError:
+            # TimeoutError (NOT the raw worker result, NOT a hang) is what
+            # the deadline guards in _execute_case / execute_run catch.
+            pass
+        elapsed = time.monotonic() - started
+        assert elapsed < 3.0, (
+            f"caller blocked {elapsed:.2f}s for a 4s worker with a 1.2s budget — "
+            "the TOTAL-lifetime bound must unblock the caller at the budget"
+        )
+
+    asyncio.run(drive())
+    # The worker thread was entered (it really ran in the pool) and was
+    # ABANDONED in place — still sleeping, not killed or awaited.
+    assert slow_worker.get("name", "").startswith("evaldiff-storage")
 
 
 def test_account_cap_atomic_across_workers(sessions):

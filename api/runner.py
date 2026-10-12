@@ -20,6 +20,7 @@ import asyncio
 import contextlib
 import json
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from uuid import uuid4
@@ -43,43 +44,149 @@ class RunDeadlineExceeded(Exception):
 
 _pool: ThreadPoolExecutor | None = None
 _pool_size = 4
-_pool_sem: dict[asyncio.AbstractEventLoop, asyncio.Semaphore] = {}
+_gate: AsyncGate | None = None
 _pool_lock = threading.Lock()
 
 
-def _storage_pool(
-    loop: asyncio.AbstractEventLoop,
-) -> tuple[ThreadPoolExecutor, asyncio.Semaphore]:
-    """Bounded pool + per-loop admission semaphore for synchronous storage
+class StorageCallTimeout(Exception):
+    """A storage call outlived its total lifetime bound (NEEDS-DOING C).
+
+    The per-call budget is a TOTAL lifetime bound: botocore's read_timeout
+    is a per-socket-read limit (default 60 s), so a peer that keeps
+    dribbling bytes can still hold the call — and the pool thread — for
+    far longer. This bound ends it regardless.
+    """
+
+
+class AsyncGate:
+    """Process-wide, cross-loop async admission gate (NEEDS-DOING C).
+
+    Bounded by ``capacity``: at most ``capacity`` storage calls are
+    admitted into the executor pool at once, across ALL event loops in
+    the process — the pool is process-wide, so the admission bound must
+    be too (a per-loop semaphore reopens the queue-growth path when a
+    new loop is created in the same process).
+
+    Slot accounting (signal, don't assign): ``free`` counts slots not
+    yet taken. ``acquire()`` takes a slot atomically under the lock;
+    a waiter that cannot take one parks on a future. ``release()``
+    (called from the pool's done-callback when work REALLY finishes)
+    bumps ``free`` and wakes up to ``free`` parked waiters as pure
+    signals to take slots — each slot stays in ``free`` until its
+    woken waiter actually takes it. A lost or spurious wake therefore
+    can neither leak a slot nor double-release one: the waiter simply
+    re-checks ``free`` on resume, and a waiter that times out or is
+    cancelled has taken nothing, so it has nothing to return.
+
+    Waiters are woken via ``loop.call_soon_threadsafe`` (a worker
+    thread releases while the loop thread waits); a closed loop is
+    skipped — its slot remains in ``free`` for the next acquirer.
+    """
+
+    def __init__(self, capacity: int) -> None:
+        self.capacity = max(1, capacity)
+        self.free = self.capacity
+        self._waiters: list[asyncio.Future] = []
+        self._lock = threading.Lock()
+
+    async def acquire(self) -> None:
+        while True:
+            loop = asyncio.get_running_loop()
+            with self._lock:
+                if self.free > 0:
+                    self.free -= 1
+                    return
+                # Park: append under the lock (inline — no nested lock
+                # acquisition, which would self-deadlock on a non-
+                # reentrant threading.Lock).
+                fut: asyncio.Future = loop.create_future()
+                self._waiters.append(fut)
+            # Wake signal, or timeout / cancellation. The finally below
+            # removes the parked future whatever the outcome; we never
+            # take a slot here, so there is nothing to release on exit.
+            try:
+                await fut
+            finally:
+                with self._lock:
+                    if fut in self._waiters:
+                        self._waiters.remove(fut)
+            # Woken — loop and re-check free. Spurious wakes are
+            # harmless: the slot stays in ``free`` until taken.
+            continue
+
+    def _wake_one(self, fut: asyncio.Future) -> None:
+        # Runs on the loop thread. The waiter may have been cancelled
+        # between the done() check in release() and this hop — a set on
+        # a cancelled/done future would raise and crash the loop, so
+        # suppress it; the slot simply stays in free.
+        with contextlib.suppress(asyncio.InvalidStateError):
+            if not fut.done():
+                fut.set_result(True)
+
+    def release(self) -> None:
+        """One admitted call finished: free its slot and wake up to
+        ``free`` parked waiters (called from the pool's done-callback,
+        exactly once per admitted submission).
+
+        The freed slot goes back to ``free`` (NOT to any waiter
+        directly): woken waiters are re-checking signals, and a slot
+        stays available until one of them actually takes it. A lost or
+        spurious wake therefore can neither leak a slot nor
+        double-release one, and a waiter that timed out or was
+        cancelled has taken nothing — so it has nothing to return.
+        """
+        with self._lock:
+            if self.free < self.capacity:
+                self.free += 1
+            alive: list[asyncio.Future] = []
+            woken = 0
+            for fut in self._waiters:
+                if fut.done():
+                    continue  # timed out / cancelled: drop it
+                loop = fut.get_loop()
+                if loop.is_closed():
+                    continue  # closed loop: drop it, slot stays in free
+                if woken < self.free:
+                    try:
+                        loop.call_soon_threadsafe(self._wake_one, fut)
+                        woken += 1
+                    except RuntimeError:
+                        # Loop closed between the check and the hop: drop
+                        # the waiter; the slot stays in free.
+                        continue
+                alive.append(fut)
+            self._waiters = alive
+
+
+def _storage_pool() -> tuple[ThreadPoolExecutor, AsyncGate]:
+    """Bounded pool + process-wide admission gate for synchronous storage
     calls (NEEDS-DOING C).
 
-    A stalled S3 call occupies a thread until the client's own transport
-    timeout and cannot be cancelled. Three bounds keep that from leaking:
+    A stalled S3 call occupies a thread until its per-call lifetime
+    bound and cannot be cancelled. Three bounds keep that from leaking:
 
     - the pool caps LIVE threads (``max_storage_threads``);
-    - the admission semaphore is acquired BEFORE ``pool.submit``, so a
-      call whose waiter times out while waiting for a slot never enters
-      the executor's UNBOUNDED internal queue — the old
-      submit-then-wait pattern let 100 timed-out submissions queue 100
-      work items behind one blocked thread, growing memory without
-      limit;
-    - the underlying boto3 calls have a finite lifetime (connect/read
-      timeouts, ``storage_timeout``), so a stuck call dies on its own,
-      freeing its thread and slot instead of pinning them — and
-      delaying process shutdown — for the life of the process.
+    - the admission gate (PROCESS-WIDE, shared by every event loop) is
+      acquired BEFORE ``pool.submit``, so a call whose waiter times out
+      while waiting for a slot never enters the executor's UNBOUNDED
+      internal queue — the old submit-then-wait pattern let 100
+      timed-out submissions queue 100 work items behind one blocked
+      thread, growing memory without limit;
+    - every admitted call has a finite TOTAL lifetime (``_storage_call``
+      budget + connect/read transport timeouts), so the caller is never
+      blocked past its bound even while the work thread is still inside
+      the call. (A call abandoned past its budget still terminates on
+      the transport's own read timeout, so shutdown delay stays bounded
+      by ``storage_timeout`` rather than the life of the process.)
 
-    The semaphore is released only when the work ACTUALLY finishes (a
-    done-callback on the concurrent.futures.Future, hopped onto the loop
-    thread via ``call_soon_threadsafe``) — NOT when the waiter times
-    out. A timed-out waiter that released its slot early would admit a
-    replacement call right back into the stalled pool's queue, which is
-    exactly the leak being closed.
-
-    The pool (a plain threading executor) is loop-independent and shared;
-    the semaphore is loop-bound (asyncio 3.10+) and therefore created
-    PER loop — production runs one loop, tests run one per ``asyncio.run``.
+    The slot is released exactly once, on the WORKER thread (a
+    done-callback on the concurrent.futures.Future, no loop hop) — NOT
+    when the budget lapses and NOT when a waiter times out. Releasing
+    early would admit a replacement call right back into the stalled
+    pool's queue, which is exactly the leak being closed; and a timed-out
+    waiter never took a slot, so it has nothing to return.
     """
-    global _pool, _pool_size
+    global _pool, _pool_size, _gate
     with _pool_lock:
         if _pool is None:
             settings = state.settings
@@ -91,39 +198,169 @@ def _storage_pool(
             _pool = ThreadPoolExecutor(
                 max_workers=_pool_size, thread_name_prefix="evaldiff-storage"
             )
-        sem = _pool_sem.get(loop)
-        if sem is None:
-            sem = asyncio.Semaphore(_pool_size)
-            _pool_sem[loop] = sem
-        return _pool, sem
+            _gate = AsyncGate(_pool_size)
+        return _pool, _gate
 
 
-async def _storage_call(fn, *args) -> object:
-    """One storage call: admitted, off the event loop, on the bounded pool.
+def _call_with_lifetime(fn, *args, budget: float | None = None, signal: object = None) -> object:
+    """Run one synchronous storage call with a TOTAL lifetime bound
+    (NEEDS-DOING C). Runs IN the pool thread; ``signal`` (a thread-safe
+    callable ``signal(result=...)`` / ``signal(error=...)`` built on the
+    caller's loop) reports the outcome — success, error, or budget
+    timeout — to the awaiting caller.
 
-    Admission happens before the work item is enqueued; the slot is
-    returned only when the work completes (see ``_storage_pool``).
-    Callers that time out while waiting for a slot raise (or are
-    cancelled) without ever touching the executor queue.
+    ``budget`` caps the WHOLE call (connect + request + response body) —
+    not just the time between socket reads: botocore's ``read_timeout``
+    (default 60 s) is a per-read value, so a peer that keeps dribbling
+    bytes can otherwise hold the call — and the pool thread — for far
+    longer than any per-read cap.
+
+    A lightweight daemon watchdog (NOT a pool thread) sleeps at most
+    ``budget`` seconds; when the budget lapses it signals the timeout to
+    the caller, who unblocks immediately. The abandoned work thread
+    keeps running until the transport's own connect/read timeouts fire
+    (``storage_timeout``), which also bounds how long it can delay
+    process shutdown.
+
+    ``signal`` is first-signaller-wins (the caller's future is set at
+    most once), so whichever of the worker / watchdog finishes first
+    reports and the late one is a no-op. ``budget=None`` (or <= 0)
+    leaves the bound to the transport's connect/read timeouts only (no
+    watchdog).
     """
-    loop = asyncio.get_running_loop()
-    _pool, sem = _storage_pool(loop)
-    await sem.acquire()
+    if budget is not None and budget > 0:
+        threading.Thread(
+            target=_watchdog,
+            args=(budget, signal),
+            daemon=True,
+            name="evaldiff-storage-wd",
+        ).start()
     try:
-        cfut = _pool.submit(fn, *args)
+        result = fn(*args)
+    except BaseException as exc:
+        signal(error=exc)
+        raise
+    signal(result=result)
+    return result
+
+
+def _watchdog(budget: float, signal: object) -> None:
+    # Daemon: dies with the process. Never holds a pool thread. The work
+    # may be abandoned forever (a peer stalling past the transport
+    # timeouts too) — the watchdog only needs the budget to lapse, so it
+    # sleeps rather than waiting on the work's completion.
+    deadline = time.monotonic() + budget
+    while time.monotonic() < deadline:
+        time.sleep(0.05)
+    signal(error=StorageCallTimeout(f"storage call exceeded its total lifetime bound ({budget}s)"))
+
+
+async def _storage_call(fn, *args, timeout: float | None = None) -> object:
+    """One storage call: admitted, off the event loop, lifetime-bounded.
+
+    Admission is process-wide and happens before the work item is
+    enqueued; the slot is released when the worker thread finishes (see
+    ``_storage_pool``). ``timeout`` (seconds) is the TOTAL lifetime
+    budget for the underlying call (see ``_call_with_lifetime``).
+    """
+    _pool, gate = _storage_pool()
+    await gate.acquire()
+
+    fut: asyncio.Future = asyncio.get_running_loop().create_future()
+    # If the caller gave up first (deadline / cancellation), the error
+    # we resolve later would otherwise sit un-retrieved and log a
+    # warning — mark it retrieved eagerly.
+
+    def _reap(_f: asyncio.Future) -> None:
+        if _f.cancelled():
+            return
+        with contextlib.suppress(BaseException):
+            _f.exception()
+
+    fut.add_done_callback(_reap)
+
+    def _resolve(result: object | None = None, error: BaseException | None = None) -> None:
+        # Runs ON the loop thread; re-checks done() there so the first
+        # signaller (worker or watchdog) wins and the second is a no-op.
+        if fut.done():
+            return
+        if error is not None:
+            fut.set_exception(error)
+        else:
+            fut.set_result(result)
+
+    def signal(*, result: object | None = None, error: BaseException | None = None) -> None:
+        # Thread-safe (called from the pool thread or the watchdog
+        # thread): hops the resolution onto the owning loop; a closed
+        # loop is a silent no-op (the caller is gone; the worker thread
+        # is a daemon and dies with the process).
+        if fut.done():
+            return
+        loop = fut.get_loop()
+        if loop.is_closed():
+            return
+        try:
+            loop.call_soon_threadsafe(_resolve, result, error)
+        except RuntimeError:
+            # Loop closed between the check and the hop: the caller is
+            # gone; the worker thread dies with the process.
+            pass
+
+    try:
+        cfut = _pool.submit(_call_with_lifetime, fn, *args, budget=timeout, signal=signal)
     except BaseException:
-        sem.release()  # submit failed: do not leak the admission slot
+        # submit failed: the work never started, so no one will release
+        # the slot — hand it back now (the worker-finished release path
+        # is the only other one that ever fires for this call).
+        gate.release()
         raise
 
     def _release(_done: object) -> None:
         # Fires in the worker thread when the call REALLY finishes (or
-        # errors). Hopped onto the loop thread; suppressed when the loop
-        # is already closed (shutdown) — the pool is being torn down.
-        with contextlib.suppress(Exception):
-            loop.call_soon_threadsafe(sem.release)
+        # errors). gate.release() is thread-safe (its own lock) and must
+        # run here — NOT hopped onto a possibly-closed loop — so the
+        # slot is never lost to a loop that is shutting down. Waking
+        # parked waiters on other loops is safe against a closed loop
+        # (the hop is unwound and that waiter's own timeout path owns
+        # its exit).
+        with contextlib.suppress(BaseException):
+            _done.exception()  # mark retrieved: no "never retrieved" warning
+        gate.release()
 
     cfut.add_done_callback(_release)
-    return await asyncio.wrap_future(cfut)
+    try:
+        # Await the caller future (NOT the pool future): the watchdog
+        # resolves it at the budget lapse even while the worker thread
+        # is still blocked — that is the point of the total-lifetime
+        # bound. The pool future is only the release latch.
+        return await fut
+    except StorageCallTimeout:
+        # The call outlived its TOTAL lifetime budget. Surface it as a
+        # timeout so every caller (deadline guards) treats a budgeted
+        # call exactly like a deadline lapse: discarded, not charged.
+        # (asyncio.TimeoutError IS the built-in TimeoutError on 3.11+
+        # and asyncio's own alias on 3.10 — callers catch the asyncio
+        # name in both.) The abandoned work thread is a daemon and dies
+        # with the process; the slot is released by _release when the
+        # worker thread actually finishes.
+        raise asyncio.TimeoutError(
+            f"storage call exceeded its total lifetime bound ({timeout}s)"
+        ) from None
+
+
+def _storage_call_budget(remaining: float | None) -> float | None:
+    """Total lifetime budget for one storage call (seconds).
+
+    The transport's connect/read timeouts only bound the time between
+    socket reads, so the total budget is the per-call cap; a run
+    deadline narrows it further so a budgeted call can never outlive
+    the run (NEEDS-DOING C).
+    """
+    settings = state.settings
+    budget = float(getattr(settings, "storage_timeout", 15.0)) if settings else 15.0
+    if remaining is not None:
+        budget = min(budget, float(remaining))
+    return budget if budget > 0 else None
 
 
 async def call_model(
@@ -178,10 +415,10 @@ async def _execute_case(
 
     The model call and judge run under the caller's deadline guard (they
     are cancelled in flight on expiry). The result write to storage runs
-    off the event loop (bounded pool + admission semaphore) so a slow
-    backend cannot stall lease heartbeats; the deadline bounds the wait,
-    and a write that lands after the deadline does not charge the case —
-    it raises RunDeadlineExceeded instead."""
+    off the event loop (bounded pool + process-wide admission gate) so a
+    slow backend cannot stall lease heartbeats; the deadline bounds the
+    wait, and a write that lands after the deadline does not charge the
+    case — it raises RunDeadlineExceeded instead."""
     prompt = _render(run.prompt_template, case)
     output, t_in, t_out = await _with_retries(
         call_model,
@@ -215,19 +452,31 @@ async def _execute_case(
         if remaining is not None and remaining > 0:
             try:
                 output_key = await asyncio.wait_for(
-                    _storage_call(state.storage.put_json, key, payload),
+                    _storage_call(
+                        state.storage.put_json,
+                        key,
+                        payload,
+                        timeout=_storage_call_budget(remaining),
+                    ),
                     timeout=remaining,
                 )
             except asyncio.TimeoutError:
-                # Deadline lapsed while the write was in flight (or
+                # Deadline lapsed (or the call outlived its TOTAL
+                # lifetime budget) while the write was in flight (or
                 # waiting for a slot): the in-flight write may still
                 # complete in its thread, but it is DISCARDED — the case
                 # is not charged.
                 raise RunDeadlineExceeded("run deadline exceeded") from None
         else:
             # Unlimited budget (or none left, caught by the caller): still
-            # off the event loop.
-            output_key = await _storage_call(state.storage.put_json, key, payload)
+            # off the event loop, still bounded to the total lifetime
+            # (storage_timeout) so a slow backend cannot pin the thread.
+            output_key = await _storage_call(
+                state.storage.put_json,
+                key,
+                payload,
+                timeout=_storage_call_budget(None),
+            )
     return output, t_in, t_out, score, output_key
 
 
@@ -349,13 +598,26 @@ async def execute_run(
         elif remaining is not None:
             try:
                 cases = await asyncio.wait_for(
-                    _storage_call(state.storage.get_json, dataset.storage_key),
+                    _storage_call(
+                        state.storage.get_json,
+                        dataset.storage_key,
+                        timeout=_storage_call_budget(remaining),
+                    ),
                     timeout=remaining,
                 )
             except asyncio.TimeoutError:
+                # Deadline lapsed (or the call outlived its TOTAL
+                # lifetime budget) while the read was in flight: the
+                # run fails and is refunded — the worker slot is freed.
                 raise RunDeadlineExceeded("run deadline exceeded") from None
         else:
-            cases = await _storage_call(state.storage.get_json, dataset.storage_key)
+            # No deadline on this run: still bound the total lifetime
+            # (storage_timeout) so a slow backend cannot pin the thread.
+            cases = await _storage_call(
+                state.storage.get_json,
+                dataset.storage_key,
+                timeout=_storage_call_budget(None),
+            )
         cases = cases if isinstance(cases, list) else cases.get("cases", [])
 
         # Quota: the full dataset size was RESERVED at enqueue time (ledger
