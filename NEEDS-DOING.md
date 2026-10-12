@@ -333,10 +333,21 @@ qualify a different artifact for release.
   tests and an encrypted restic round trip pass. Keep this item open until
   off-host capacity/access, notification delivery and the D2 restore drill are
   demonstrated in staging.
-- [ ] Prepare reproducible staging, end-to-end, restore, and load-test scripts
+- [x] Prepare reproducible staging, end-to-end, restore, and load-test scripts
   and a release-evidence template. Identify candidates by commit and image
   digest. Record package/database/driver/storage/proxy versions, build inputs,
   commands, configuration excluding secrets, and results.
+  Implemented locally in `deploy/qualification/` and `deploy/staging-compose.yml`:
+  isolated candidate startup, authenticated HTTPS fixtures, ten-account e2e,
+  baseline/seeded soak, large/fairness/outage scenarios, scoped staging backup,
+  guarded verified restore, raw private measurements and release-evidence
+  template. Summaries remain incomplete until all D2/D3 evidence is attached;
+  retry first-claim traces, client-IP/notification/slow-storage assertions and
+  rollback are explicit rehearsals. Local tests cover isolation and accelerated
+  baseline scheduling; no real staging stack or recovery drill was run.
+  Validation: full suite **205 passed, 1 skipped**; final qualification module
+  **14 passed**, including a total-deadline slow-drip regression; ruff
+  lint/format, YAML topology checks, CLI help and whitespace checks pass.
 
 #### D2. Staging and recovery drills
 

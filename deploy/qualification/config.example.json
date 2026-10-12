@@ -1,0 +1,16 @@
+{
+  "purpose": "isolated-staging",
+  "project": "evaldiff-staging-candidate",
+  "base_url": "https://staging.example.com",
+  "fixture_url": "https://fixture.example.com",
+  "fixture_key": "replace-with-a-staging-only-fixture-secret",
+  "fixture_version": 1,
+  "version": "0.0.18",
+  "revision": "replace-with-full-candidate-commit",
+  "image": "registry.example.com/evaldiff@sha256:replace-with-tested-manifest-digest",
+  "image_id": "sha256:replace-with-local-image-id",
+  "seed": 20261012,
+  "volume_path": "/var/lib/docker",
+  "evidence_directory": "/var/lib/evaldiff-qualification/candidate",
+  "environment_file": "/etc/evaldiff-staging/candidate.env"
+}

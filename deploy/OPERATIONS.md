@@ -414,3 +414,12 @@ evidence before rollout. A host crash or SIGKILL can prevent automatic restart
 and leave private staging files: inspect container state, restart SeaweedFS then
 API, remove abandoned helpers/staging captures, and investigate the alert.
 Do not treat local script tests as an off-host recovery or RPO/RTO qualification.
+
+## Reproducible qualification tooling
+
+Use [qualification/README.md](qualification/README.md) for the isolated staging
+Compose topology, controlled HTTPS fixture, e2e/load/fault scenarios, scoped
+backup and restore rehearsal. Copy [qualification/EVIDENCE.md](qualification/EVIDENCE.md)
+for each candidate release. Raw latency results are explicitly incomplete until
+all contract gates and D2/D3 evidence pass. These tools have local regression
+coverage; staging execution and measured recovery/load qualification remain pending.
