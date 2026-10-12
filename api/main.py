@@ -19,14 +19,12 @@ from sqlalchemy.orm import Session
 
 from . import __version__
 from .auth import create_key, get_current_account
-from .db import Base, get_session, make_engine, state
+from .db import get_session, make_engine, state
 from .diff import compute_diff, diff_to_markdown, run_to_markdown
 from .migrate_secrets import verify_credentials
 from .models import Account, Dataset, Run
+from .operations import Operations
 from .quota import (
-    ledger_metadata,
-    migrate_legacy_usage,
-    migrate_run_deadline_column,
     now_period,
     reserve_deadline,
     used_cases_for,
@@ -35,6 +33,7 @@ from .quota import reserve as reserve_quota
 from .ratelimit import RateLimiter
 from .secrets import KeyCipher, encrypt_api_key
 from .settings import Settings
+from .startup import initialize_database
 from .storage import build_storage
 from .worker import enqueue_run, worker_loop
 
@@ -155,19 +154,23 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def _lifespan(_: FastAPI):
         import logging
 
+        from sqlalchemy import event
         from sqlalchemy.orm import sessionmaker
 
         # Validate before creating storage, touching the database, or starting workers.
         cipher = KeyCipher(settings)
         engine = make_engine(settings.database_url)
+        operations = Operations(settings)
         worker_task: asyncio.Task | None = None
+        monitor_task: asyncio.Task | None = None
         try:
-            Base.metadata.create_all(engine)
-            ledger_metadata().create_all(engine)
+            initialize_database(engine)
             verify_credentials(engine, cipher, require_encrypted=settings.production)
+            event.listen(engine, "handle_error", lambda _: operations.record_database_error())
             state.settings = settings
             state.session_factory = sessionmaker(bind=engine)
             state.storage = build_storage(settings)
+            state.storage.error_callback = operations.record_storage_error
             state.limiter = (
                 RateLimiter(
                     rpm=settings.rate_limit_rpm,
@@ -178,21 +181,27 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 if settings.rate_limit_rpm > 0 and settings.signup_rate_per_min > 0
                 else None
             )
-            with state.session_factory() as session:
-                migrate_legacy_usage(session)
-                migrate_run_deadline_column(session)
             if cipher.primary is None:
                 logging.getLogger("evaldiff").warning(
                     "Development mode: EVALDIFF_SECRET_KEY is not set; model credentials "
                     "are stored in plaintext. Production requires encryption."
                 )
+            app.state.operations = operations
+            monitor_task = asyncio.create_task(operations.monitor())
             if settings.enable_worker:
                 stop = asyncio.Event()
                 app.state.worker_stop = stop
-                app.state.worker_task = asyncio.create_task(worker_loop(stop, interval=1.0))
+                app.state.worker_task = asyncio.create_task(
+                    worker_loop(stop, interval=1.0, health=operations.worker)
+                )
                 worker_task = app.state.worker_task
+                operations.worker_task = worker_task
             yield
         finally:
+            if monitor_task is not None:
+                monitor_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await monitor_task
             if worker_task is not None:
                 with contextlib.suppress(Exception):
                     app.state.worker_stop.set()
@@ -211,6 +220,22 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "version": __version__,
             "storage": type(state.storage).__name__,
         }
+
+    @app.get("/ready")
+    async def ready(response: Response) -> dict:
+        snapshot = app.state.operations.snapshot()
+        response.status_code = 200 if snapshot["ready"] else 503
+        response.headers["Cache-Control"] = "no-store"
+        return {
+            "status": "ready" if snapshot["ready"] else "not_ready",
+            "checks": snapshot["checks"],
+        }
+
+    @app.get("/ops", include_in_schema=False)
+    async def operations_snapshot(response: Response) -> dict:
+        # Private deployment-network endpoint; Caddy blocks public access.
+        response.headers["Cache-Control"] = "no-store"
+        return app.state.operations.snapshot()
 
     # ---------- auth ----------
     @app.post("/v1/auth/signup", response_model=SignupOut, status_code=status.HTTP_201_CREATED)
@@ -530,6 +555,8 @@ def run_server() -> None:
         factory=True,
         host="0.0.0.0",
         port=8000,
+        # Production topology uses one process: rate-limit buckets are local.
+        workers=1,
         log_level="info",
         # Proxy-header handling: honors X-Forwarded-For/-Proto from peers
         # in FORWARDED_ALLOW_IPS (default: 127.0.0.1,::1). Set

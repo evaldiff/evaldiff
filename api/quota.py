@@ -239,8 +239,8 @@ def migrate_run_deadline_column(session: Session) -> None:
     table exactly once. Guarded by a marker row (portable across the
     psycopg 3.x ``rowcount == -1`` quirk), and additionally no-ops when
     the column already exists (e.g. a freshly ``create_all``-ed schema).
-    The caller must stop all old processes first (as with the legacy
-    usage backfill).
+    Startup calls this under initialize_database's database lock and outer
+    transaction. Stop all old processes first (as with the legacy backfill).
     """
     if (
         session.execute(
@@ -276,6 +276,8 @@ def migrate_legacy_usage(session: Session) -> None:
     run ID preserves any legacy counter balance whose runs are unavailable.
     All old application processes must be stopped during this upgrade.
 
+    Startup serializes this SELECT/INSERT under initialize_database's lock
+    and outer transaction; standalone callers must provide serialization.
     Idempotency is guarded by a SELECT on the migration-marker row, not by
     ``ON CONFLICT DO NOTHING`` + ``rowcount``: some Postgres drivers
     (psycopg 3.x) report ``rowcount == -1`` for INSERT ... SELECT / ON

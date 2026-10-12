@@ -4,9 +4,16 @@ Stop all API/worker processes from the previous release before starting the
 updated application. Take a database backup first. Mixed old/new workers are
 not supported during this upgrade: older workers do not honor job leases.
 
-Startup creates the reservation ledger and job-lease tables, then runs an
-atomic, one-time usage migration before accepting requests or starting workers.
-It reconstructs missing reservations using each run's creation month, preserves
+Startup serializes schema creation and one-time migrations on one database
+connection and transaction before accepting requests or starting workers.
+PostgreSQL uses a database-scoped transaction advisory lock with a 30-second
+lock timeout; SQLite uses `BEGIN IMMEDIATE` with its configured 30-second
+write-lock wait. A failed startup rolls back schema/migration changes and
+releases the lock. Migration helpers cannot commit the outer transaction.
+The deadline-column migration precedes the legacy usage backfill so older
+databases can be read using the current Run model.
+
+The usage migration reconstructs missing reservations using each run's creation month, preserves
 existing ledger entries, and retains legacy usage not attributable to retained
 runs as an account balance. An interrupted migration rolls back and is retried
 on startup. Historical counters do not contain enough information to reconstruct
@@ -28,6 +35,12 @@ client. For other topologies set `FORWARDED_ALLOW_IPS` to your proxy's
 address range. Keep direct API access private and have the proxy sanitize
 forwarded headers — Uvicorn only reads `X-Forwarded-For` from peers in the
 trust list, so untrusted callers cannot spoof their IP to evade limits.
+
+## Deployment topology and budgets
+
+See [OPERATIONS.md](OPERATIONS.md) for the single-process deployment contract,
+explicit concurrency and rate limits, and initial CPU/memory/storage budgets.
+These defaults require staging and load qualification before release.
 
 ## PostgreSQL regression tests
 

@@ -1,0 +1,19 @@
+[Unit]
+Description=evaldiff aggregate health and resource monitor
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=simple
+User=deploy
+WorkingDirectory=/home/deploy/evaldiff/deploy
+EnvironmentFile=/home/deploy/evaldiff/deploy/.env
+ExecStart=/usr/bin/python3 /home/deploy/evaldiff/deploy/monitor.py --loop --volume-path /var/lib/docker
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=evaldiff-monitor
+
+[Install]
+WantedBy=multi-user.target

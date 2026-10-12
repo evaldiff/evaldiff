@@ -1,4 +1,8 @@
 api.evaldiff.io {
+	# Operations aggregates are private to the deployment network.
+	@operations path /ops /ops/*
+	respond @operations 404
+
 	reverse_proxy api:8000
 	encode zstd gzip
 

@@ -260,26 +260,53 @@ qualify a different artifact for release.
 
 #### D1. Operations tooling and qualification contract
 
-- [ ] Record the intended API/worker process counts, per-process concurrency,
+- [x] Record the intended API/worker process counts, per-process concurrency,
   and CPU/memory/storage limits. Define whether rate limits apply per process
   or across the deployment. The current buckets are process-local; implement
-  shared limiting if deployment-wide enforcement is required.
-- [ ] Set numerical targets before qualification: queue-wait and API-latency
+  shared limiting if deployment-wide enforcement is required. Implemented
+  locally in `deploy/OPERATIONS.md`, Compose, and the server entry point:
+  one API process with four run slots and process-local limits; initial
+  resource budgets await staging/load qualification.
+- [x] Set numerical targets before qualification: queue-wait and API-latency
   percentiles and limits, maximum memory, workload size/account mix/dataset
   sizes, soak duration, and tolerated errors. Define backup cadence, retention,
   recovery-time objective (RTO), and recovery-point objective (RPO). Record
   values and pass/fail rules in the runbook before observing test results.
+  Defined in `deploy/OPERATIONS.md` (qualification contract v1): baseline,
+  24-hour mixed soak, large-dataset/fairness/fault phases, latency/resource
+  gates, six-hour RPO, 60-minute RTO, and backup retention. Targets are
+  initial release gates; automation and measured qualification remain pending.
 - [ ] Serialize startup schema creation and migrations. The current migration
-  marker SELECT followed by INSERT is a known concurrent-startup gap. Cover
+  marker SELECT followed by INSERT requires serialization. Cover
   fresh schema creation, `migrate_legacy_usage`, and the deadline-column
   migration. Both app processes must start successfully, with each migration
   applied once and legacy usage preserved without dropped or double-counted
   rows. Keep the upgrade requirement to stop old-version processes;
   serialization does not establish mixed-version safety.
+  Implemented locally in `api/startup.py`: one outer transaction holds a
+  PostgreSQL advisory lock or SQLite write lock across schema creation and
+  both migrations; deadline schema is upgraded before legacy ORM reads.
+  Fresh/legacy two-process startup and failure/rollback tests pass on SQLite.
+  PostgreSQL execution remains pending; the existing CI job includes these
+  tests when `EVALDIFF_TEST_POSTGRES_URL` is set. Keep this item open until
+  PostgreSQL validation passes. Local validation: full suite **148 passed,
+  1 skipped**; recovery/startup module **14 passed**; ruff lint/format and
+  whitespace checks passed. Tests ran in an isolated Python 3.13 environment.
 - [ ] Add readiness checks for database/storage access and enabled-worker
   health with bounded probe timeouts. Monitor queue age/depth, run failures and
   timeouts, worker heartbeats, memory, and database/storage errors. Define and
   test alert thresholds. Redact keys and avoid logging sensitive payloads.
+  Implemented locally: cached `/ready`, private `/ops` (blocked by Caddy),
+  killable total-deadline dependency probes, scheduler/error instrumentation,
+  and `deploy/monitor.py` plus a systemd template for container/host resource
+  measurements and structured alerts. Numerical thresholds and setup are in
+  `deploy/OPERATIONS.md`. Local regression validation is recorded below;
+  keep this item open until staging verifies routing, resources, the installed
+  monitor, and operator-configured notification delivery. Local validation:
+  full suite **157 passed, 1 skipped**; final operations/recovery regressions
+  **24 passed**, including a real slow-drip S3 probe; Compose/CI YAML parsing,
+  ruff lint/format, and whitespace checks passed. Docker/PostgreSQL and
+  installed-systemd execution remain unavailable locally.
 - [x] Implement container-local API and HTTPS-through-Caddy smoke checks in
   `deploy/deploy.sh` (implemented locally; stack verification pending).
 - [ ] Fail deployment clearly on dependency/readiness failures and unexpected

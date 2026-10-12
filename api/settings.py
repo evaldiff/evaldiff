@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from pydantic import SecretStr
+from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -83,3 +83,8 @@ class Settings(BaseSettings):
     # at this budget, but an in-flight synchronous call keeps its pool
     # thread and admission slot until it actually finishes. 0 disables.
     storage_timeout: float = 15.0
+
+    # Cached dependency probes run in killable processes under a total deadline.
+    readiness_timeout: float = Field(default=3.0, gt=0, le=30)
+    readiness_interval: float = Field(default=5.0, gt=0, le=60)
+    worker_health_timeout: float = Field(default=30.0, gt=0, le=300)

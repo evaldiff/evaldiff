@@ -7,11 +7,14 @@ these same tests against PostgreSQL as well as SQLite.
 import asyncio
 import json
 import os
+import subprocess
+import sys
+import time
 from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
 import pytest
-from sqlalchemy import create_engine, select, text, update
+from sqlalchemy import create_engine, inspect, select, text, update
 from sqlalchemy.engine import make_url
 from sqlalchemy.orm import sessionmaker
 
@@ -422,3 +425,123 @@ def test_concurrent_recovery_has_one_winner(sessions):
     with sessions() as session:
         assert session.get(Job, jid).status == "pending"
         assert used_cases_for(aid, now_period(), session) == 2
+
+
+_STARTUP_CHILD = """
+import os
+import time
+from pathlib import Path
+from starlette.testclient import TestClient
+from api.main import create_app
+from api.settings import Settings
+
+Path(os.environ["STARTUP_READY"]).touch()
+stop = time.monotonic() + 30
+while not Path(os.environ["STARTUP_GO"]).exists():
+    if time.monotonic() > stop:
+        raise RuntimeError("startup barrier timed out")
+    time.sleep(0.02)
+settings = Settings(
+    database_url=os.environ["STARTUP_DB"],
+    production=True,
+    enable_worker=False,
+    secret_key=os.environ["STARTUP_KEY"],
+    s3_endpoint=None,
+)
+with TestClient(create_app(settings)) as client:
+    assert client.get("/health").status_code == 200
+"""
+
+
+@pytest.mark.parametrize("legacy", [False, True], ids=["fresh", "legacy"])
+def test_two_process_app_startup(sessions, tmp_path, legacy):
+    from api.quota import MIGRATIONS
+    from api.secrets import generate_secret_key
+
+    engine = sessions.kw["bind"]
+    aid = None
+    if legacy:
+        with sessions() as session:
+            account, run = seed(session, count=200, used=900)
+            aid, rid = account.id, run.id
+            session.commit()
+        # Simulate a pre-Part-C database, including its missing column.
+        with engine.begin() as connection:
+            connection.exec_driver_sql("ALTER TABLE runs DROP COLUMN deadline_at")
+        ledger_metadata().drop_all(engine)
+    else:
+        ledger_metadata().drop_all(engine)
+        Base.metadata.drop_all(engine)
+
+    go = tmp_path / "go"
+    children = []
+    ready = [tmp_path / f"ready-{i}" for i in range(2)]
+    try:
+        for path in ready:
+            env = {
+                key: value for key, value in os.environ.items() if not key.startswith("EVALDIFF_")
+            }
+            env.update(
+                STARTUP_DB=engine.url.render_as_string(hide_password=False),
+                STARTUP_KEY=generate_secret_key(),
+                STARTUP_READY=str(path),
+                STARTUP_GO=str(go),
+            )
+            children.append(
+                subprocess.Popen(
+                    [sys.executable, "-c", _STARTUP_CHILD],
+                    env=env,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            )
+        until = time.monotonic() + 30
+        while not all(path.exists() for path in ready):
+            assert all(child.poll() is None for child in children), "child failed before barrier"
+            assert time.monotonic() < until, "startup barrier timed out"
+            time.sleep(0.02)
+        go.touch()
+        for child in children:
+            assert child.wait(timeout=45) == 0, "app startup failed"
+    finally:
+        for child in children:
+            if child.poll() is None:
+                child.kill()
+            child.wait(timeout=5)
+
+    assert "deadline_at" in {c["name"] for c in inspect(engine).get_columns("runs")}
+    with sessions() as session:
+        assert set(session.execute(select(MIGRATIONS.c.name)).scalars()) == {
+            "legacy_usage_v1",
+            "run_deadline_v1",
+        }
+        rows = session.execute(select(RUN_RESERVATIONS)).all()
+        if legacy:
+            assert used_cases_for(aid, now_period(), session) == 900
+            assert len(rows) == 2
+            assert {row.run_id for row in rows} == {rid, -aid}
+            assert next(row for row in rows if row.run_id == rid).reserved == 200
+            assert next(row for row in rows if row.run_id == -aid).charged == 700
+        else:
+            assert rows == []
+
+
+def test_startup_failure_rolls_back_schema_and_migrations(sessions, monkeypatch):
+    from api import startup
+
+    engine = sessions.kw["bind"]
+    ledger_metadata().drop_all(engine)
+    Base.metadata.drop_all(engine)
+    original = startup.migrate_legacy_usage
+
+    def fail_after_migration(session):
+        original(session)  # helper commits must not commit the outer transaction
+        raise RuntimeError("injected startup failure")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(startup, "migrate_legacy_usage", fail_after_migration)
+        with pytest.raises(RuntimeError, match="injected startup failure"):
+            startup.initialize_database(engine)
+    assert inspect(engine).get_table_names() == []
+    startup.initialize_database(engine)  # rollback must also release the lock
+    assert "runs" in inspect(engine).get_table_names()

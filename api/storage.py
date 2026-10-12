@@ -8,10 +8,26 @@ R2) works. When S3 is unset, datasets are stored inline in Postgres.
 from __future__ import annotations
 
 import json
+from functools import wraps
+
+
+def observed_operation(method):
+    @wraps(method)
+    def observed(self, *args, **kwargs):
+        try:
+            return method(self, *args, **kwargs)
+        except Exception:
+            if self.error_callback is not None:
+                self.error_callback()
+            raise
+
+    return observed
 
 
 class Storage:
     """Interface used by the app. Two implementations, selected in config."""
+
+    error_callback = None
 
     def put_json(self, key: str, obj: object) -> str: ...
     def get_json(self, key: str) -> object: ...
@@ -24,13 +40,16 @@ class InMemoryStorage(Storage):
     def __init__(self) -> None:
         self._data: dict[str, bytes] = {}
 
+    @observed_operation
     def put_json(self, key: str, obj: object) -> str:
         self._data[key] = json.dumps(obj, ensure_ascii=False).encode()
         return key
 
+    @observed_operation
     def get_json(self, key: str) -> object:
         return json.loads(self._data[key].decode())
 
+    @observed_operation
     def presigned_put_url(self, key: str, expires_in: int = 900) -> str:
         raise NotImplementedError("no presigned URLs without S3")
 
@@ -82,24 +101,27 @@ class S3Storage(Storage):
             # AWS-only needs LocationConstraint; most S3-compatible endpoints don't.
             try:
                 self._s3.create_bucket(**kwargs)
-            except Exception as exc:  # noqa: BLE001
+            except Exception:  # noqa: BLE001
                 import logging
 
-                logging.getLogger("evaldiff.storage").debug("no region needed: %s", exc)
+                logging.getLogger("evaldiff.storage").debug("retrying bucket creation with region")
                 self._s3.create_bucket(
                     **kwargs,
                     CreateBucketConfiguration={"LocationConstraint": "eu-central-1"},
                 )
 
+    @observed_operation
     def put_json(self, key: str, obj: object) -> str:
         body = json.dumps(obj, ensure_ascii=False).encode()
         self._s3.put_object(Bucket=self.bucket, Key=key, Body=body, ContentType="application/json")
         return key
 
+    @observed_operation
     def get_json(self, key: str) -> object:
         resp = self._s3.get_object(Bucket=self.bucket, Key=key)
         return json.loads(resp["Body"].read().decode())
 
+    @observed_operation
     def presigned_put_url(self, key: str, expires_in: int = 900) -> str:
         return self._s3.generate_presigned_url(
             "put_object",

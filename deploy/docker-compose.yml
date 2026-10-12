@@ -1,9 +1,20 @@
 name: evaldiff
 
+# Bound local container logs to about 30 MiB per service.
+x-logging: &bounded-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
 services:
   # --- SeaweedFS (S3-compatible object storage) ---
   seaweed:
+    logging: *bounded-logging
     image: chrislusf/seaweedfs:4.48
+    cpus: "1.0"
+    mem_limit: 1g
+    memswap_limit: 1g
     command: server -s3 -dir /data
     volumes:
       - weeddata:/data
@@ -18,7 +29,11 @@ services:
 
   # --- Postgres ---
   db:
+    logging: *bounded-logging
     image: postgres:16-alpine
+    cpus: "1.0"
+    mem_limit: 1g
+    memswap_limit: 1g
     environment:
       POSTGRES_USER: evaldiff
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
@@ -32,8 +47,13 @@ services:
       timeout: 5s
       retries: 10
 
-  # --- API + worker (same process, v0) ---
+  # Qualification topology: one API process with an embedded worker scheduler.
+  # See OPERATIONS.md before changing process counts or resource budgets.
   api:
+    logging: *bounded-logging
+    cpus: "2.0"
+    mem_limit: 2g
+    memswap_limit: 2g
     build:
       context: ..
       dockerfile: deploy/Dockerfile
@@ -49,6 +69,16 @@ services:
       EVALDIFF_PUBLIC_BASE_URL: https://api.evaldiff.io
       EVALDIFF_DEFAULT_QUOTA: "1000"
       EVALDIFF_ENABLE_WORKER: "true"
+      EVALDIFF_WORKER_CONCURRENCY: "4"
+      EVALDIFF_MAX_ACTIVE_RUNS_PER_ACCOUNT: "2"
+      EVALDIFF_MAX_QUEUED_RUNS_PER_ACCOUNT: "10"
+      EVALDIFF_MAX_STORAGE_THREADS: "4"
+      EVALDIFF_RUN_MAX_SECONDS: "1800"
+      EVALDIFF_STORAGE_TIMEOUT: "15"
+      EVALDIFF_RATE_LIMIT_RPM: "30"
+      EVALDIFF_RATE_LIMIT_BURST: "60"
+      EVALDIFF_SIGNUP_RATE_PER_MIN: "5"
+      EVALDIFF_SIGNUP_BURST: "5"
       # Caddy fronts this service (reverse_proxy api:8000). Uvicorn's
       # proxy-header middleware trusts X-Forwarded-For only from peers in
       # this range, so request.client resolves to the REAL client (correct
@@ -61,17 +91,21 @@ services:
       db:
         condition: service_healthy
       seaweed:
-        condition: service_started
+        condition: service_healthy
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8000/health')"]
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8000/ready', timeout=2)"]
       interval: 20s
       timeout: 5s
       retries: 10
 
   # --- TLS + proxy ---
   caddy:
+    logging: *bounded-logging
     image: caddy:2-alpine
+    cpus: "0.5"
+    mem_limit: 256m
+    memswap_limit: 256m
     ports:
       - "80:80"
       - "443:443"

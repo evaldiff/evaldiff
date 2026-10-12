@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import time
 from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
@@ -195,7 +196,7 @@ async def poll_once(session, *, max_active_per_account: int | None = None) -> in
     return 0
 
 
-async def _heartbeat(job_id: int, token: str, attempt: asyncio.Task) -> None:
+async def _heartbeat(job_id: int, token: str, attempt: asyncio.Task, health=None) -> None:
     try:
         while True:
             await asyncio.sleep(HEARTBEAT_SECONDS)
@@ -204,15 +205,17 @@ async def _heartbeat(job_id: int, token: str, attempt: asyncio.Task) -> None:
                 session.commit()
     except asyncio.CancelledError:
         raise
-    except Exception:
-        log.exception("could not renew job %s; stopping attempt", job_id)
+    except Exception:  # noqa: BLE001 - log only fixed diagnostics
+        if health is not None:
+            health.heartbeat_errors += 1
+        log.warning("could not renew job %s; stopping attempt", job_id)
         attempt.cancel()
 
 
-async def _run_attempt(job_id: int, token: str, run_id: int) -> None:
+async def _run_attempt(job_id: int, token: str, run_id: int, health=None) -> None:
     """Execute one job and finalize its lease; owns its heartbeat task."""
     attempt = asyncio.create_task(execute_run(run_id, job_id=job_id, lease_token=token))
-    heartbeat = asyncio.create_task(_heartbeat(job_id, token, attempt))
+    heartbeat = asyncio.create_task(_heartbeat(job_id, token, attempt, health))
     try:
         await attempt
         _finish_job(job_id, token)
@@ -226,10 +229,12 @@ async def _run_attempt(job_id: int, token: str, run_id: int) -> None:
             await heartbeat
 
 
-async def worker_loop(stop: asyncio.Event, interval: float = 2.0) -> None:
+async def worker_loop(stop: asyncio.Event, interval: float = 2.0, *, health=None) -> None:
     active: set[asyncio.Task] = set()
     try:
         while not stop.is_set():
+            if health is not None:
+                health.last_tick = time.monotonic()
             # Reap finished attempts so the slot count stays accurate.
             if active:
                 for t in list(active):
@@ -254,10 +259,12 @@ async def worker_loop(stop: asyncio.Event, interval: float = 2.0) -> None:
                         token = job.claimed_by
                         payload = json.loads(job.payload_json or "{}")
                         run_id = payload["run_id"]
-                except Exception:
-                    log.exception("job claim error")
+                except Exception:  # noqa: BLE001 - do not log database parameters
+                    if health is not None:
+                        health.claim_errors += 1
+                    log.warning("job claim error")
                     break
-                active.add(asyncio.create_task(_run_attempt(job_id, token, run_id)))
+                active.add(asyncio.create_task(_run_attempt(job_id, token, run_id, health)))
             try:
                 await asyncio.wait_for(stop.wait(), timeout=interval)
             except asyncio.TimeoutError:
