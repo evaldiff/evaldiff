@@ -45,17 +45,27 @@ class S3Storage(Storage):
         secret_key: str,
         bucket: str,
         region: str = "eu-central-1",
+        timeout: float = 15.0,
     ) -> None:
         import boto3
         from botocore.config import Config
 
+        # Finite lifetime for every S3 call (NEEDS-DOING C): botocore's
+        # default read timeout is unbounded, so a stalled connection would
+        # pin its pool thread for the life of the process. A timed-out
+        # call raises (ClientError/ReadTimeoutError) and is treated as a
+        # failed storage operation — the bounded pool + admission
+        # semaphore (api.runner) cap the damage a stall can do.
+        kwargs = {"signature_version": "s3v4"}
+        if timeout and timeout > 0:
+            kwargs.update(connect_timeout=timeout, read_timeout=timeout)
         self._s3 = boto3.client(
             "s3",
             endpoint_url=endpoint,
             aws_access_key_id=access_key,
             aws_secret_access_key=secret_key,
             region_name=region,
-            config=Config(signature_version="s3v4"),
+            config=Config(**kwargs),
         )
         self.bucket = bucket
         self._ensure_bucket()
@@ -107,5 +117,6 @@ def build_storage(settings) -> Storage:
             secret_key=settings.s3_secret_key or "",
             bucket=settings.s3_bucket,
             region=settings.s3_region,
+            timeout=float(getattr(settings, "storage_timeout", 0.0)),
         )
     return InMemoryStorage()

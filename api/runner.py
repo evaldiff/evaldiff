@@ -42,23 +42,44 @@ class RunDeadlineExceeded(Exception):
 
 
 _pool: ThreadPoolExecutor | None = None
+_pool_size = 4
+_pool_sem: dict[asyncio.AbstractEventLoop, asyncio.Semaphore] = {}
 _pool_lock = threading.Lock()
 
 
-def _storage_pool() -> ThreadPoolExecutor:
-    """Bounded pool for synchronous storage calls (NEEDS-DOING C).
+def _storage_pool(
+    loop: asyncio.AbstractEventLoop,
+) -> tuple[ThreadPoolExecutor, asyncio.Semaphore]:
+    """Bounded pool + per-loop admission semaphore for synchronous storage
+    calls (NEEDS-DOING C).
 
     A stalled S3 call occupies a thread until the client's own transport
-    timeout — it can no longer be cancelled. An unbounded pool (the
-    default of ``asyncio.to_thread``) would therefore grow one live
-    thread per stalled call, and each one would also be joined on
-    loop shutdown. A bounded pool caps both: at most
-    ``max_storage_threads`` live storage threads per process; extra
-    calls wait in a queue, where they are cancellable (the deadline
-    guard fires while they wait, and the worker loop's shutdown gather
-    cancels queued futures instead of joining them).
+    timeout and cannot be cancelled. Three bounds keep that from leaking:
+
+    - the pool caps LIVE threads (``max_storage_threads``);
+    - the admission semaphore is acquired BEFORE ``pool.submit``, so a
+      call whose waiter times out while waiting for a slot never enters
+      the executor's UNBOUNDED internal queue — the old
+      submit-then-wait pattern let 100 timed-out submissions queue 100
+      work items behind one blocked thread, growing memory without
+      limit;
+    - the underlying boto3 calls have a finite lifetime (connect/read
+      timeouts, ``storage_timeout``), so a stuck call dies on its own,
+      freeing its thread and slot instead of pinning them — and
+      delaying process shutdown — for the life of the process.
+
+    The semaphore is released only when the work ACTUALLY finishes (a
+    done-callback on the concurrent.futures.Future, hopped onto the loop
+    thread via ``call_soon_threadsafe``) — NOT when the waiter times
+    out. A timed-out waiter that released its slot early would admit a
+    replacement call right back into the stalled pool's queue, which is
+    exactly the leak being closed.
+
+    The pool (a plain threading executor) is loop-independent and shared;
+    the semaphore is loop-bound (asyncio 3.10+) and therefore created
+    PER loop — production runs one loop, tests run one per ``asyncio.run``.
     """
-    global _pool
+    global _pool, _pool_size
     with _pool_lock:
         if _pool is None:
             settings = state.settings
@@ -66,9 +87,43 @@ def _storage_pool() -> ThreadPoolExecutor:
                 from .settings import Settings
 
                 settings = Settings()
-            size = max(1, int(getattr(settings, "max_storage_threads", 4)))
-            _pool = ThreadPoolExecutor(max_workers=size, thread_name_prefix="evaldiff-storage")
-        return _pool
+            _pool_size = max(1, int(getattr(settings, "max_storage_threads", 4)))
+            _pool = ThreadPoolExecutor(
+                max_workers=_pool_size, thread_name_prefix="evaldiff-storage"
+            )
+        sem = _pool_sem.get(loop)
+        if sem is None:
+            sem = asyncio.Semaphore(_pool_size)
+            _pool_sem[loop] = sem
+        return _pool, sem
+
+
+async def _storage_call(fn, *args) -> object:
+    """One storage call: admitted, off the event loop, on the bounded pool.
+
+    Admission happens before the work item is enqueued; the slot is
+    returned only when the work completes (see ``_storage_pool``).
+    Callers that time out while waiting for a slot raise (or are
+    cancelled) without ever touching the executor queue.
+    """
+    loop = asyncio.get_running_loop()
+    _pool, sem = _storage_pool(loop)
+    await sem.acquire()
+    try:
+        cfut = _pool.submit(fn, *args)
+    except BaseException:
+        sem.release()  # submit failed: do not leak the admission slot
+        raise
+
+    def _release(_done: object) -> None:
+        # Fires in the worker thread when the call REALLY finishes (or
+        # errors). Hopped onto the loop thread; suppressed when the loop
+        # is already closed (shutdown) — the pool is being torn down.
+        with contextlib.suppress(Exception):
+            loop.call_soon_threadsafe(sem.release)
+
+    cfut.add_done_callback(_release)
+    return await asyncio.wrap_future(cfut)
 
 
 async def call_model(
@@ -123,10 +178,10 @@ async def _execute_case(
 
     The model call and judge run under the caller's deadline guard (they
     are cancelled in flight on expiry). The result write to storage runs
-    off the event loop (``asyncio.to_thread``) so a slow backend cannot
-    stall lease heartbeats; the deadline is then re-read FRESH after the
-    write lands, so a write that finishes after the deadline still does
-    not charge the case — it raises RunDeadlineExceeded instead."""
+    off the event loop (bounded pool + admission semaphore) so a slow
+    backend cannot stall lease heartbeats; the deadline bounds the wait,
+    and a write that lands after the deadline does not charge the case —
+    it raises RunDeadlineExceeded instead."""
     prompt = _render(run.prompt_template, case)
     output, t_in, t_out = await _with_retries(
         call_model,
@@ -147,37 +202,32 @@ async def _execute_case(
     )
     output_key = None
     if state.storage is not None and run.id:
-        # Synchronous storage client, off the event loop (P1) and on a
-        # BOUNDED pool (P2): a stalled call occupies one of at most
-        # max_storage_threads live threads until the client's own
-        # transport timeout — the pool cannot grow unbounded with stalled
-        # writes, and the process never joins an unbounded set of them.
-        # The write is allowed to FINISH in that thread (a discarded
-        # blob if the deadline lapsed mid-write), but the DEADLINE is
-        # checked after it lands — a late write must not charge the case.
-        # The event loop is never blocked by the write, so heartbeats and
-        # concurrent attempts keep running.
+        # Synchronous storage client, off the event loop (P1) and on the
+        # bounded pool (P2): the pool caps live threads, the admission
+        # semaphore caps queued work items (timed-out waiters never enter
+        # the executor queue), and the client's transport timeout gives
+        # the in-flight call a finite lifetime. A late write is
+        # DISCARDED — it must not charge the case. The event loop is
+        # never blocked by the write, so heartbeats and concurrent
+        # attempts keep running.
         key = f"runs/{run.id}/attempts/{attempt}/case_{seq}/output.json"
         payload = {"output": output, "score": score.__dict__}
         if remaining is not None and remaining > 0:
             try:
                 output_key = await asyncio.wait_for(
-                    asyncio.get_running_loop().run_in_executor(
-                        _storage_pool(), state.storage.put_json, key, payload
-                    ),
+                    _storage_call(state.storage.put_json, key, payload),
                     timeout=remaining,
                 )
             except asyncio.TimeoutError:
-                # Deadline lapsed while the write was in flight (or queued):
-                # the in-flight write may still complete in its thread, but
-                # it is DISCARDED — the case is not charged.
+                # Deadline lapsed while the write was in flight (or
+                # waiting for a slot): the in-flight write may still
+                # complete in its thread, but it is DISCARDED — the case
+                # is not charged.
                 raise RunDeadlineExceeded("run deadline exceeded") from None
         else:
             # Unlimited budget (or none left, caught by the caller): still
             # off the event loop.
-            output_key = await asyncio.get_running_loop().run_in_executor(
-                _storage_pool(), state.storage.put_json, key, payload
-            )
+            output_key = await _storage_call(state.storage.put_json, key, payload)
     return output, t_in, t_out, score, output_key
 
 
@@ -283,8 +333,9 @@ async def execute_run(
         # The deadline covers the dataset read too (NEEDS-DOING C): a
         # stalled S3 read must fail the run — settling quota and freeing
         # the worker slot — instead of holding both until the client's
-        # transport timeout. Bounded pool + wait_for: off the event loop,
-        # capped threads, cancellable wait.
+        # transport timeout. Bounded pool + admission semaphore: off the
+        # event loop, capped threads, and timed-out waiters never enter
+        # the executor queue.
         remaining = remaining_deadline_seconds(run)
         if remaining is not None and remaining <= 0:
             raise RunDeadlineExceeded("run deadline exceeded")
@@ -292,23 +343,19 @@ async def execute_run(
         dataset = run.dataset
         # The dataset read is a synchronous storage call; run it on the
         # bounded pool so a slow backend cannot stall heartbeats (P1) and
-        # cannot grow the pool past its cap (P2).
+        # cannot grow the pool's live threads or queued work (P2).
         if dataset.cases_json:
             cases = json.loads(dataset.cases_json)
         elif remaining is not None:
             try:
                 cases = await asyncio.wait_for(
-                    asyncio.get_running_loop().run_in_executor(
-                        _storage_pool(), state.storage.get_json, dataset.storage_key
-                    ),
+                    _storage_call(state.storage.get_json, dataset.storage_key),
                     timeout=remaining,
                 )
             except asyncio.TimeoutError:
                 raise RunDeadlineExceeded("run deadline exceeded") from None
         else:
-            cases = await asyncio.get_running_loop().run_in_executor(
-                _storage_pool(), state.storage.get_json, dataset.storage_key
-            )
+            cases = await _storage_call(state.storage.get_json, dataset.storage_key)
         cases = cases if isinstance(cases, list) else cases.get("cases", [])
 
         # Quota: the full dataset size was RESERVED at enqueue time (ledger

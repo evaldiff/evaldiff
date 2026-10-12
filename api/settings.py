@@ -75,3 +75,10 @@ class Settings(BaseSettings):
     # threads a stall can pin, and the deadline guard fires while extra
     # calls wait in the queue. 1 (or below) forces a single thread.
     max_storage_threads: int = 4
+
+    # Finite lifetime for the underlying storage calls themselves
+    # (NEEDS-DOING C): connect + read timeout (seconds) for S3
+    # put/get. botocore's default read timeout is UNBOUNDED — without
+    # this, a stalled call pins its pool thread (and admission slot)
+    # for the life of the process, and delays shutdown. 0 disables.
+    storage_timeout: float = 15.0

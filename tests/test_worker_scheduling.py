@@ -628,12 +628,12 @@ def test_stalled_writes_cannot_exhaust_pool(sessions, monkeypatch):
     """P2: repeated stalled writes must not consume an unbounded number
     of threads. With a pool of ONE storage thread, two concurrent runs
     whose writes each stall for 2.5s cannot run their writes in parallel
-    — the second waits in the queue (where the deadline guard can still
-    cancel it), so at most ONE write thread is ever live. An unbounded
-    pool (asyncio.to_thread) would have two live threads at once.
+    — the second waits at admission (BEFORE the executor queue), so at
+    most ONE write thread is ever live. An unbounded pool
+    (asyncio.to_thread) would have two live threads at once.
 
     Also pins the deadline semantics for the queued case: the run whose
-    write could not get a thread before its budget ran out is failed and
+    write could not get a slot before its budget ran out is failed and
     refunded, not charged."""
     # One storage thread + no pool yet (other tests may have created one).
     import api.runner as runner_module
@@ -701,6 +701,58 @@ def test_stalled_writes_cannot_exhaust_pool(sessions, monkeypatch):
     # The core P2 assertion: the writes never ran in parallel — the pool
     # capped live storage threads at 1. (An unbounded pool: peak == 2.)
     assert peak <= 1, f"storage pool was not bounded: {peak} concurrent storage threads"
+
+
+def test_timed_out_submissions_do_not_enter_queue(sessions, monkeypatch):
+    """P2 (queue admission): calls that time out while waiting for a pool
+    slot must not leave work items behind in the executor's internal
+    queue — the reported leak. With submit-then-wait (run_in_executor),
+    100 timed-out submissions enqueue 100 cancelled work items behind
+    one blocked thread and the queue grows with every stall. With
+    admission, a waiter that times out is rejected BEFORE pool.submit:
+    zero items are ever enqueued for it."""
+    import api.runner as runner_module
+
+    monkeypatch.setattr(runner_module, "_pool", None)
+    monkeypatch.setattr(state, "settings", Settings(max_storage_threads=1))
+
+    blocker = threading.Event()
+    entered = threading.Event()
+
+    def blocked():
+        entered.set()
+        blocker.wait(10)
+        return "ok"
+
+    async def drive():
+        loop = asyncio.get_running_loop()
+        pool, _sem = runner_module._storage_pool(loop)
+
+        async def _wait_threaded(event: threading.Event, seconds: float = 10.0) -> None:
+            deadline = time.monotonic() + seconds
+            while not event.is_set() and time.monotonic() < deadline:
+                await asyncio.sleep(0.02)
+
+        in_flight = asyncio.create_task(runner_module._storage_call(blocked))
+        await _wait_threaded(entered)
+        # The in-flight item is RUNNING (dequeued), not queued.
+        assert pool._work_queue.qsize() == 0
+
+        waiters = [
+            asyncio.wait_for(runner_module._storage_call(lambda: "x"), timeout=0.3)
+            for _ in range(100)
+        ]
+        results = await asyncio.gather(*waiters, return_exceptions=True)
+        assert all(isinstance(r, asyncio.TimeoutError) for r in results)
+        queued = pool._work_queue.qsize()
+        blocker.set()
+        assert await in_flight == "ok"
+        return queued
+
+    queued = asyncio.run(drive())
+    # The 100 timed-out submissions left ZERO work items in the executor
+    # queue — they were rejected at admission, before pool.submit.
+    assert queued == 0, f"{queued} work items queued behind the blocked thread"
 
 
 def test_account_cap_atomic_across_workers(sessions):
