@@ -248,43 +248,100 @@ storage slot occupied before considering Part C complete.
 
 ### D. Verify the production stack and prepare operations
 
-Files: `.github/workflows/ci.yml`, `tests/test_recovery_quota.py`, `deploy/`.
-Depends on A–C for final release qualification.
+Files: `.github/workflows/ci.yml`, `tests/test_recovery_quota.py`,
+`api/main.py`, `api/quota.py`, `api/ratelimit.py`, `deploy/`.
+
+Execute in three stages: operations tooling → staging and recovery drills →
+load qualification and release. Tooling and preliminary drills can proceed
+alongside B–C. Final qualification requires A–C to be complete, including C's
+storage cancellation/resource-release and graceful-shutdown acceptance tests.
+Repeat affected checks after candidate changes; preliminary results do not
+qualify a different artifact for release.
+
+#### D1. Operations tooling and qualification contract
+
+- [ ] Record the intended API/worker process counts, per-process concurrency,
+  and CPU/memory/storage limits. Define whether rate limits apply per process
+  or across the deployment. The current buckets are process-local; implement
+  shared limiting if deployment-wide enforcement is required.
+- [ ] Set numerical targets before qualification: queue-wait and API-latency
+  percentiles and limits, maximum memory, workload size/account mix/dataset
+  sizes, soak duration, and tolerated errors. Define backup cadence, retention,
+  recovery-time objective (RTO), and recovery-point objective (RPO). Record
+  values and pass/fail rules in the runbook before observing test results.
+- [ ] Serialize startup schema creation and migrations. The current migration
+  marker SELECT followed by INSERT is a known concurrent-startup gap. Cover
+  fresh schema creation, `migrate_legacy_usage`, and the deadline-column
+  migration. Both app processes must start successfully, with each migration
+  applied once and legacy usage preserved without dropped or double-counted
+  rows. Keep the upgrade requirement to stop old-version processes;
+  serialization does not establish mixed-version safety.
+- [ ] Add readiness checks for database/storage access and enabled-worker
+  health with bounded probe timeouts. Monitor queue age/depth, run failures and
+  timeouts, worker heartbeats, memory, and database/storage errors. Define and
+  test alert thresholds. Redact keys and avoid logging sensitive payloads.
+- [x] Implement container-local API and HTTPS-through-Caddy smoke checks in
+  `deploy/deploy.sh` (implemented locally; stack verification pending).
+- [ ] Fail deployment clearly on dependency/readiness failures and unexpected
+  version/revision. Use readiness in Compose health checks and dependency
+  ordering where appropriate.
+- [x] Build the deployment image from local source in `deploy/Dockerfile`
+  (implemented locally; candidate provenance and stack verification pending).
+- [ ] Automate database and object-storage backups with failure reporting and
+  the defined retention policy. Preserve encryption keys separately; record
+  which key set matches each backup without exposing key material.
+- [ ] Prepare reproducible staging, end-to-end, restore, and load-test scripts
+  and a release-evidence template. Identify candidates by commit and image
+  digest. Record package/database/driver/storage/proxy versions, build inputs,
+  commands, configuration excluding secrets, and results.
+
+#### D2. Staging and recovery drills
 
 - [ ] Run the complete suite against PostgreSQL using
-  `EVALDIFF_TEST_POSTGRES_URL` and a disposable database. Record the tested
-  commit, database/driver versions, commands, and results. Require the existing
-  PostgreSQL CI job to pass before release.
+  `EVALDIFF_TEST_POSTGRES_URL` and a disposable database. Record the commit,
+  database/driver versions, commands, and results. Require the existing
+  PostgreSQL CI job, which already gates the build, to pass before release.
 - [ ] Exercise concurrent quota reservations, settlement, month boundaries,
-  lease recovery, and legacy migration on PostgreSQL. Test the intended number
-  of app/worker processes and simultaneous startup; serialize migrations if
-  concurrent startup exposes a race. Specifically start two app processes at
-  once against the same DB and assert the one-time `migrate_legacy_usage` runs
-  exactly once without dropping or double-counting a legacy row.
-- [ ] Deploy the exact candidate artifact to staging with PostgreSQL,
+  lease recovery, and legacy migration on PostgreSQL at the intended process
+  count. Start two app processes simultaneously against fresh and legacy
+  databases; assert both start successfully and migrations run exactly once,
+  with correct resulting rows and usage totals.
+- [ ] Deploy the exact candidate image to isolated staging with PostgreSQL,
   SeaweedFS, Caddy, and production settings. Verify signup, encrypted keys,
   dataset upload, HTTPS model calls, diff/report output, and real client-IP
-  rate limiting end to end.
-- [ ] Correct deployment smoke checks: the API port is not published to the
-  host, so check it inside the container and check HTTPS through Caddy.
-  Fail deployment clearly when dependencies or readiness checks fail.
-- [ ] Add readiness checks and monitor queue age/depth, run failures/timeouts,
-  worker heartbeat health, memory, and database/storage errors. Redact keys and
-  avoid logging sensitive dataset/model payloads.
-- [ ] Automate database and object-storage backups; preserve the encryption key
-  separately. Restore into an isolated stack and verify data and key access.
-  Record recovery-time and data-loss targets and the measured restore result.
-- [ ] Run a load/soak test with mixed accounts, large datasets, slow/failing
-  endpoints, and worker restarts. Agree on queue-wait, API-latency, and memory
-  limits before the test; record whether the candidate meets them.
-- [ ] Publish the tested version and build the deployment image from that exact
-  reviewed checkout (the Dockerfile now installs local source). Follow the
-  upgrade instructions, verify the deployed version and revision, and document
-  a tested rollback procedure.
+  rate limiting, including the chosen multi-process contract. Exercise
+  dependency outages and confirm readiness/deployment checks fail.
+- [ ] Restore automated database and object-storage backups into an isolated
+  stack with matching encryption keys. Verify datasets, reports, key access,
+  and queued-run execution. Measure restore time and recoverable data age;
+  compare them with the defined RTO/RPO.
+- [ ] Rehearse rollback. Document compatible application/schema/key versions
+  and whether rollback requires restoring matching database/object backups.
+  Explicitly account for writes lost since the backup and how writes are
+  stopped during rollback. Verify restored version/revision, data, credentials,
+  and run execution.
 
-Acceptance: all required CI checks and staging scenarios pass, resource usage
-stays within the agreed budget, and restore/recovery drills succeed. Attach
-results to the release; do not infer production validation from SQLite tests.
+#### D3. Load qualification and release
+
+- [ ] After A–C are complete, run the defined load/soak workload with mixed
+  accounts, large datasets, slow/failing endpoints, and worker restarts at the
+  intended process count. Include slow-drip storage and shutdown with storage
+  slots occupied. Record latency/queue-wait percentiles, peak memory, failures,
+  resource release, and recovery against the predeclared limits.
+- [ ] Assemble evidence for the final commit/image digest: required CI checks,
+  staging scenarios, concurrent startup, alert checks, backup/restore
+  measurements, rollback rehearsal, and load/soak results. Rerun affected
+  checks when fixes change the candidate.
+- [ ] Publish the tested version and deploy the qualified image from the exact
+  reviewed checkout. Follow upgrade instructions; verify deployed version,
+  revision, image digest, readiness, and HTTPS smoke scenarios.
+
+Acceptance: numerical targets and deployment topology are documented; required
+CI checks and final-candidate staging scenarios pass; resource usage remains
+within budget; and restore/recovery and rollback drills meet stated targets.
+Attach evidence to the release. Do not infer production validation from SQLite
+or mark D complete from scripts alone. C's open storage/shutdown limitation
+blocks final qualification.
 
 ### E. Finish the CLI workflow and actionable reports
 
