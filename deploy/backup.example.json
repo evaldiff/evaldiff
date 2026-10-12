@@ -1,0 +1,14 @@
+{
+  "host": "evaldiff-production",
+  "off_host_confirmed": true,
+  "staging_directory": "/var/lib/evaldiff-backup/staging",
+  "status_file": "/var/lib/evaldiff-backup/status.json",
+  "data": {
+    "repository": "sftp:backup-data@backup.example:/srv/evaldiff-data",
+    "password_file": "/etc/evaldiff-backup/data-password"
+  },
+  "keys": {
+    "repository": "sftp:backup-keys@keys.example:/srv/evaldiff-keys",
+    "password_file": "/etc/evaldiff-backup/keys-password"
+  }
+}

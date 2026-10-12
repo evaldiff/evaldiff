@@ -327,6 +327,12 @@ qualify a different artifact for release.
 - [ ] Automate database and object-storage backups with failure reporting and
   the defined retention policy. Preserve encryption keys separately; record
   which key set matches each backup without exposing key material.
+  Implementation: `deploy/backup.py`, separate encrypted restic data/key
+  repositories, coordinated stopped-writer capture, verified readback, retention,
+  private status and monitor alerts, plus a four-hour systemd timer. Local failure
+  tests and an encrypted restic round trip pass. Keep this item open until
+  off-host capacity/access, notification delivery and the D2 restore drill are
+  demonstrated in staging.
 - [ ] Prepare reproducible staging, end-to-end, restore, and load-test scripts
   and a release-evidence template. Identify candidates by commit and image
   digest. Record package/database/driver/storage/proxy versions, build inputs,

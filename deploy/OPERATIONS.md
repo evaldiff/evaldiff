@@ -175,8 +175,9 @@ persisted deadline plus 180 seconds fails qualification.
   Record restored/missing writes, consistency checks, elapsed recovery time,
   and observed RPO. Both stores and matching keys are mandatory for a pass.
 
-Backup automation, alerts, load scripts, and measured drills remain later D
-items. This contract defines their targets; it does not claim they exist yet.
+Backup automation and aggregate alerts are implemented below. Off-host setup,
+notification delivery, load scripts, and measured recovery drills still require
+staging evidence; this contract does not claim those gates have passed.
 
 ## Readiness and monitoring
 
@@ -333,3 +334,83 @@ failure, wrong labels/running image, and HTTPS revision mismatch without touchin
 a deployment. A separate wheel check verifies the generated revision module is
 packaged and importable. Actual Docker builds, Compose dependency waits, ACME,
 and stack-level failure injection still require staging validation.
+
+## Automated coordinated backups
+
+`backup.py` is a host-side Python 3.11+ tool using restic (tested with 0.18.1).
+Install restic from its official release and verify its published checksum.
+Use `backup.example.json` as the template for `/etc/evaldiff-backup/config.json`.
+All configuration, password and optional credential JSON files must be private
+(mode 0600), owned by the deployment user. Provision different strong repository
+passwords and distinct off-host data/key repositories with separate access
+credentials; initialize each repository explicitly using `restic init`.
+`off_host_confirmed` is an operator assertion: verify the destinations really
+reside on independent hosts; a remote-looking URL alone cannot prove that.
+Optional `credentials_file` per repository supplies an environment-variable JSON
+mapping for that repository only. The deployment application's environment is
+not forwarded to restic. Secure SSH host-key verification and unattended access
+before enabling the timer; never disable host-key checking.
+
+Create `/var/lib/evaldiff-backup` and its `staging` child owned by `deploy`, mode
+0700, on a filesystem with space for a full capture plus a full downloaded
+verification copy. Size retained off-host capacity using the policy above and
+25% headroom before activation. Copy the service/timer templates to systemd,
+adjust checkout/user paths, run one manual service invocation, inspect its
+status/journal, and only then enable the timer. The timer runs every four hours,
+leaving completion slack for the six-hour RPO. Runs have a 50-minute command
+budget; systemd supplies a 55-minute outer limit and three minutes for recovery.
+Only one backup may run at a time. **Do not deploy, rotate keys, restart services,
+or run other database/object writers during capture.** The single-writer
+Compose topology and this operational exclusion are requirements of this scheme.
+
+Before pausing writers, the tool exports the running application's primary and
+previous Fernet keys into a separate private staging directory, uploads them to
+the key repository, restores them, and compares SHA-256 digests. It then stops
+the original API and SeaweedFS containers with a graceful 30-second deadline;
+a forced kill or OOM aborts capture. PostgreSQL stays running. `pg_dump -Fc`
+captures the database, and a network-disabled helper using the exact API image
+archives the stopped SeaweedFS named volume through a read-only mount. Both
+original containers are restarted even if capture fails; successful capture
+also waits for their health checks. The database and volume must have no other
+writers. The physical object archive requires the recorded SeaweedFS image on
+restore; retain those images in an independently available image registry.
+
+The manifest records consistency time, measured pause duration, database/object
+checksums, key fingerprints and the verified key snapshot ID, container image
+IDs, API revision and compatible version. It contains no key values. Database,
+objects and manifest are uploaded together to the data repository and downloaded
+again with `restic restore --verify`; explicit file digests must also match.
+Only then is the snapshot tagged `verified`. Retention selects verified data
+points by stable deployment host (not temporary capture paths), keeping all
+points within seven days, daily points within 30 days and weekly points within
+84 days; restic deduplicates overlapping selections. Pruning follows retention.
+Key snapshots are never automatically expired or pruned: retire them manually
+only after proving no retained data point needs them. Pending/unverified
+snapshots also require operator investigation and controlled cleanup.
+See [restic retention](https://restic.readthedocs.io/en/stable/060_forget.html)
+and [restore verification](https://restic.readthedocs.io/en/stable/050_restore.html).
+
+The private atomic status file preserves the last successful consistency time
+on failure. Journald receives fixed failure-stage codes, never keys, command
+stderr, or customer content. The monitor service reports backup failure, missing
+status, a run exceeding 55 minutes, and a usable point aged six hours. Connect
+its critical events to the staging-tested operator notification route. A failed
+retention/prune operation fails the job conservatively even when a new verified
+snapshot exists. Inspect the repositories and status before recovery.
+
+For an isolated restore, choose a verified data snapshot, restore it and verify
+manifest digests, then retrieve the referenced snapshot from the separate key
+repository. Supply those exact primary/previous keys, restore the custom dump
+with `pg_restore` into a clean PostgreSQL instance, and extract `objects.tar`
+into an empty SeaweedFS volume while that service is stopped. Match the recorded
+service images and API version/revision. Prove readiness, credential decryption,
+dataset/report access and queued execution before declaring recovery complete.
+This procedure still needs the timed staging rehearsal required by D2.
+
+Backup pauses count against the existing availability and latency targets;
+there is no new exemption. Measure them during qualification. If the graceful
+stop/capture scheme cannot meet those targets, revise the capture strategy with
+evidence before rollout. A host crash or SIGKILL can prevent automatic restart
+and leave private staging files: inspect container state, restart SeaweedFS then
+API, remove abandoned helpers/staging captures, and investigate the alert.
+Do not treat local script tests as an off-host recovery or RPO/RTO qualification.

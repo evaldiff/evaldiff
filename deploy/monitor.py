@@ -135,10 +135,27 @@ def collect(volume_path):
     }
 
 
+def backup_alerts(path, now=None):
+    try:
+        status = json.loads(Path(path).read_text())
+        now = time.time() if now is None else now
+        result = []
+        if status.get("outcome") == "failed":
+            result.append({"code": "backup_failed", "severity": "critical"})
+        if now - float(status.get("last_success", 0)) >= 6 * 3600:
+            result.append({"code": "backup_stale", "severity": "critical"})
+        if status.get("outcome") == "running" and now - float(status["attempt_started"]) > 55 * 60:
+            result.append({"code": "backup_stuck", "severity": "critical"})
+        return result
+    except (OSError, ValueError, TypeError, KeyError):
+        return [{"code": "backup_status_unavailable", "severity": "critical"}]
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--volume-path", required=True, help="dedicated Docker volume filesystem")
     parser.add_argument("--loop", action="store_true")
+    parser.add_argument("--backup-status")
     args = parser.parse_args()
     previous = None
     while True:
@@ -156,6 +173,8 @@ def main():
         except Exception:  # noqa: BLE001 - diagnostics must not expose deployment secrets
             events = [{"code": "monitor_collection_failed", "severity": "critical"}]
             record = {"timestamp": int(time.time()), "alerts": events}
+        if args.backup_status:
+            events.extend(backup_alerts(args.backup_status))
         print(json.dumps(record, separators=(",", ":")), flush=True)
         if not args.loop:
             return 1 if events else 0

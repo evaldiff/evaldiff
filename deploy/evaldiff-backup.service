@@ -1,0 +1,18 @@
+[Unit]
+Description=evaldiff coordinated encrypted backup
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+User=deploy
+WorkingDirectory=/home/deploy/evaldiff/deploy
+EnvironmentFile=/home/deploy/evaldiff/deploy/.env
+ExecStart=/usr/bin/python3 /home/deploy/evaldiff/deploy/backup.py --config /etc/evaldiff-backup/config.json
+TimeoutStartSec=55min
+TimeoutStopSec=3min
+KillMode=mixed
+UMask=0077
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=evaldiff-backup
