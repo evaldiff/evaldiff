@@ -102,6 +102,9 @@ window; stop **every** API/worker replica, including processes outside Compose.
 Provision the primary key (and any required old keys) before running Compose.
 
 ```sh
+candidate_identity=$(python3 ./check_deployment.py candidate)
+read -r EVALDIFF_BUILD_VERSION EVALDIFF_BUILD_REVISION <<< "$candidate_identity"
+export EVALDIFF_BUILD_VERSION EVALDIFF_BUILD_REVISION
 docker compose config --quiet
 docker compose build api
 docker compose run --rm --no-deps api python -m api.migrate_secrets --validate-config
@@ -112,16 +115,23 @@ umask 077
 docker compose exec -T db pg_dump -U evaldiff -d evaldiff -Fc > pre-encryption.dump
 docker compose run --rm --no-deps api python -m api.migrate_secrets
 docker compose run --rm --no-deps api python -m api.migrate_secrets --check
-docker compose up -d api
+# Complete bounded readiness/identity checks after offline migration.
+bash deploy.sh
 ```
 
 Retain the database dump and matching encryption keys securely and separately.
 Back up object storage as well when preparing a complete-stack restore. Do not
 remove old backups just because migration succeeds: rehearse restoration first.
 A fresh empty database needs no migration; startup creates the new schema.
-`bash deploy.sh` validates the candidate's encryption configuration before
-starting services, but deliberately does **not** silently migrate existing data.
-The script checks API health inside the container and over HTTPS through Caddy.
+`bash deploy.sh` requires a clean committed checkout and validates the candidate's
+image identity and encryption configuration before stopping the old API or
+changing services. It deliberately does **not** silently encrypt existing data.
+It builds from an archive of the selected commit, waits for dependency/API
+readiness, and checks readiness and version/revision inside the container and
+through HTTPS/Caddy. See OPERATIONS.md for prerequisites, bounds, identity
+reporting, and failure handling. The host needs Python 3.11+ for these deployment
+checks. Direct Compose commands must export the candidate identity as above so
+they select the same commit-tagged image.
 
 The migration locks `runs`, widens PostgreSQL `api_key_ref` from `varchar(512)`
 to `text`, encrypts every nonempty plaintext credential, and validates existing

@@ -268,3 +268,68 @@ test event. Local regression tests cover cached readiness, worker liveness,
 probe timeout/cancellation cleanup, aggregate redaction, and alert thresholds;
 full-stack routing, container measurements, and notification delivery require
 staging evidence before qualification.
+
+## Deployment checks and candidate identity
+
+Run `bash deploy/deploy.sh` on the deployment host after committing the reviewed
+candidate and completing the upgrade/backup instructions. The host must already
+have Git, Python 3.11+, GNU `timeout`, `tar`, `mktemp`, a working Docker daemon,
+and Compose supporting `up --wait --wait-timeout`. The script fails if a
+prerequisite is missing; it does not install Docker or edit `/etc/hosts`. Public
+DNS and Caddy's HTTPS configuration must already point to this host.
+
+The script derives the full Git revision and version from the clean checkout,
+exports build arguments, and builds from a temporary archive of that commit.
+Ignored files and concurrent working-tree edits cannot enter the build context.
+Temporary build inputs are removed on exit. The Dockerfile bakes the revision
+into a Python module before packaging and attaches OCI version/revision labels.
+`/health` now includes the baked revision; ordinary source/PyPI installs report
+null, and manual builds without candidate arguments report `unknown`. Runtime
+environment variables do not override the baked revision. Neither null nor
+unknown qualifies for this deployment check.
+
+Compose tags the API image `evaldiff-api:<full-revision>` and does not pull it
+from a registry. Before touching services, checks require matching image labels,
+a successful encryption-config preflight, and an unchanged clean checkout.
+Deployment then stops the old Compose API, waits for healthy PostgreSQL and
+SeaweedFS, waits for ready API startup, and starts Caddy after API health passes.
+Other API/worker processes must be stopped separately as required by the
+upgrade procedure. Credential migration and backups are separate operations.
+
+After startup, every service must have exactly one running container; the
+three services with health checks must be healthy. The running API's immutable
+local image ID must equal the candidate inspected after build. Container-local
+and HTTPS checks both require fresh database/storage/worker readiness and the
+expected version/revision. Public `/ops` must return 404. Redirects, invalid
+JSON, oversized responses, and certificate failures fail the check. Set
+`EVALDIFF_DEPLOY_PUBLIC_URL` to a staging HTTPS origin if needed, and configure
+Caddy and DNS for that same origin; paths, URL credentials, and queries are
+rejected before service changes.
+
+Commands have bounded waits: build 900 seconds, encryption preflight 30 seconds,
+old API stop 45 seconds with a 30-second Docker grace period, and each startup
+stage 150 seconds with a 120-second Compose readiness wait. Individual Docker
+inspection commands have 10-second budgets. Container smoke has a 10-second
+total budget; public smoke tries up to 15 times with 10-second budgets and
+2-second pauses, then performs one final diagnostic check. Each HTTP operation
+has a 2-second socket timeout and JSON bodies are capped at 64 KiB. The enclosing
+process timeout also bounds slow-drip responses. No raw response bodies,
+container environments, health-check logs, or exception tracebacks are dumped
+by the checker.
+
+A successful run prints expected version/revision and verified local image ID.
+Record these in staging evidence. The local image ID is an image configuration
+digest, not the registry manifest digest; registry artifact promotion and its
+manifest digest remain D3 release work. A failure returns nonzero with the
+stage and a fixed diagnostic. Inspect logs privately, resolve the cause, and
+rerun qualification. Failures after stopping the old API can leave services
+partially updated; there is no automatic rollback or data restoration. Use the
+tested rollback procedure. A Docker forced stop is not proof of Part C's clean
+shutdown acceptance criterion.
+
+Real-script regression tests use inert Docker/HTTP substitutes to exercise
+invalid secrets, old Compose, dirty checkouts, unhealthy dependencies, readiness
+failure, wrong labels/running image, and HTTPS revision mismatch without touching
+a deployment. A separate wheel check verifies the generated revision module is
+packaged and importable. Actual Docker builds, Compose dependency waits, ACME,
+and stack-level failure injection still require staging validation.

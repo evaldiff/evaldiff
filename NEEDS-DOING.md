@@ -309,9 +309,19 @@ qualify a different artifact for release.
   installed-systemd execution remain unavailable locally.
 - [x] Implement container-local API and HTTPS-through-Caddy smoke checks in
   `deploy/deploy.sh` (implemented locally; stack verification pending).
-- [ ] Fail deployment clearly on dependency/readiness failures and unexpected
+- [x] Fail deployment clearly on dependency/readiness failures and unexpected
   version/revision. Use readiness in Compose health checks and dependency
-  ordering where appropriate.
+  ordering where appropriate. Implemented locally in `deploy/deploy.sh` and
+  `deploy/check_deployment.py`: explicit prerequisites, archived-commit builds,
+  baked revision/OCI labels, bounded staged readiness waits, running-image
+  checks, container and HTTPS identity checks, and public `/ops` rejection.
+  Real-script failure regressions, wheel identity packaging, ShellCheck,
+  lint/format, and YAML checks pass. Actual Docker/staging execution remains
+  pending under D2; this checkbox records implementation, not qualification.
+  Validation: full suite **181 passed, 1 skipped**; final deployment module
+  **27 passed**, including archived-input exclusion/cleanup and build-time
+  candidate changes. Generated revision is packaged/importable in an isolated
+  wheel. No production deployment was performed.
 - [x] Build the deployment image from local source in `deploy/Dockerfile`
   (implemented locally; candidate provenance and stack verification pending).
 - [ ] Automate database and object-storage backups with failure reporting and

@@ -1,5 +1,10 @@
 FROM python:3.12-slim
 
+ARG EVALDIFF_BUILD_REVISION=unknown
+ARG EVALDIFF_BUILD_VERSION=unknown
+LABEL org.opencontainers.image.revision=$EVALDIFF_BUILD_REVISION
+LABEL org.opencontainers.image.version=$EVALDIFF_BUILD_VERSION
+
 WORKDIR /app
 
 # Build the checked-out candidate, including its migration command. Copy only
@@ -7,7 +12,9 @@ WORKDIR /app
 COPY pyproject.toml README.md LICENSE ./
 COPY api ./api
 COPY evaldiff_cli ./evaldiff_cli
-RUN pip install --no-cache-dir . "psycopg[binary]>=3.1" boto3
+# Bake identity before packaging so console scripts and source imports agree.
+RUN python -m api.build_info "$EVALDIFF_BUILD_REVISION" "$EVALDIFF_BUILD_VERSION" \
+    && pip install --no-cache-dir . "psycopg[binary]>=3.1" boto3
 
 # non-root
 RUN useradd -m appuser

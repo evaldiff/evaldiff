@@ -19,6 +19,7 @@ from sqlalchemy.orm import Session
 
 from . import __version__
 from .auth import create_key, get_current_account
+from .build_info import BUILD_REVISION
 from .db import get_session, make_engine, state
 from .diff import compute_diff, diff_to_markdown, run_to_markdown
 from .migrate_secrets import verify_credentials
@@ -218,6 +219,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return {
             "status": "ok",
             "version": __version__,
+            "revision": BUILD_REVISION,
             "storage": type(state.storage).__name__,
         }
 

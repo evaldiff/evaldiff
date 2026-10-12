@@ -50,13 +50,18 @@ services:
   # Qualification topology: one API process with an embedded worker scheduler.
   # See OPERATIONS.md before changing process counts or resource budgets.
   api:
+    image: evaldiff-api:${EVALDIFF_BUILD_REVISION:-local}
+    pull_policy: never
     logging: *bounded-logging
     cpus: "2.0"
     mem_limit: 2g
     memswap_limit: 2g
     build:
-      context: ..
+      context: ${EVALDIFF_BUILD_CONTEXT:-..}
       dockerfile: deploy/Dockerfile
+      args:
+        EVALDIFF_BUILD_REVISION: ${EVALDIFF_BUILD_REVISION:-unknown}
+        EVALDIFF_BUILD_VERSION: ${EVALDIFF_BUILD_VERSION:-unknown}
     environment:
       EVALDIFF_PRODUCTION: "true"
       EVALDIFF_SECRET_KEY: ${EVALDIFF_SECRET_KEY:?Set a stable Fernet key before deployment}
@@ -114,7 +119,8 @@ services:
       - ./site:/srv/site:ro
       - caddydata:/data
     depends_on:
-      - api
+      api:
+        condition: service_healthy
     restart: unless-stopped
 
 volumes:

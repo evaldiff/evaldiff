@@ -5,7 +5,6 @@ import sqlite3
 import subprocess
 import sys
 import time
-from pathlib import Path
 
 import pytest
 from sqlalchemy import Text, inspect
@@ -256,56 +255,6 @@ def test_migration_cli_redacts_configuration_and_database_errors(tmp_path):
     assert result.returncode == 1
     assert "invalid-sensitive-url" not in result.stdout + result.stderr
     assert env["EVALDIFF_SECRET_KEY"] not in result.stdout + result.stderr
-
-
-@pytest.mark.parametrize("key_kind", ["missing", "invalid", "valid"])
-def test_deploy_preflight_before_starting_services(tmp_path, key_kind):
-    """Run the real deploy script with inert Docker/system command substitutes."""
-    script = tmp_path / "deploy.sh"
-    script.write_text(Path("deploy/deploy.sh").read_text())
-    commands = tmp_path / "bin"
-    commands.mkdir()
-    docker = commands / "docker"
-    docker.write_text(
-        "#!/usr/bin/env bash\n"
-        'printf "%s\\n" "$*" >> "$TEST_TRACE"\n'
-        'if [[ "$*" == *"--validate-config"* ]]; then\n'
-        '  exec "$TEST_PYTHON" -m api.migrate_secrets --validate-config\n'
-        "fi\n"
-        "exit 0\n"
-    )
-    # Avoid touching /etc/hosts or making network requests during script tests.
-    for name, body in (("grep", "exit 0"), ("curl", "echo healthy")):
-        command = commands / name
-        command.write_text("#!/usr/bin/env bash\n" + body + "\n")
-        command.chmod(0o700)
-    docker.chmod(0o700)
-    key = {"missing": "", "invalid": "sensitive-invalid-key", "valid": generate_secret_key()}[
-        key_kind
-    ]
-    trace = tmp_path / "commands"
-    env = {
-        **os.environ,
-        "PATH": str(commands) + os.pathsep + os.environ["PATH"],
-        "PYTHONPATH": str(Path.cwd()),
-        "TEST_PYTHON": sys.executable,
-        "TEST_TRACE": str(trace),
-        "POSTGRES_PASSWORD": "test-password",
-        "SEAWEEFS_SECRET": "test-s3-password",
-        "EVALDIFF_SECRET_KEY": key,
-    }
-    result = subprocess.run(
-        ["bash", str(script)], env=env, check=False, capture_output=True, text=True
-    )
-    calls = trace.read_text() if trace.exists() else ""
-    if key_kind == "valid":
-        assert result.returncode == 0
-        assert calls.index("--validate-config") < calls.index("compose up -d")
-    else:
-        assert result.returncode != 0
-        assert "compose up" not in calls
-    if key:
-        assert key not in result.stdout + result.stderr + calls
 
 
 def test_migration_crosses_batches_on_legacy_sqlite_schema(tmp_path):
