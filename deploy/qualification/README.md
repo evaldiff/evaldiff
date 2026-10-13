@@ -160,3 +160,42 @@ an unprepared recovery environment can meet the same time.
 Copy EVIDENCE.md into the release evidence bundle. Attach redacted measurement
 artifacts and results for every gate, keeping secret files in separate custody.
 A reviewed, measured final candidate and explicit release decision are required.
+
+## Disposable PostgreSQL qualification
+
+Run the PostgreSQL-enabled suite without Docker using PostgreSQL **16.x** server
+binaries already installed in a user-accessible directory:
+
+```sh
+python deploy/qualification/postgres.py \
+  --bin-directory /path/to/postgresql16/bin \
+  --evidence-directory /private/new-postgres-evidence-directory
+```
+
+The evidence directory must not already exist. Optional positional pytest node
+IDs select a preliminary focused run; omit them for the complete suite. The tool
+initializes a private temporary UTF-8 cluster owned by the invoking non-root
+user, disables TCP listening, rejects host authentication and allows local trust
+only inside its private Unix-socket directory. It creates a disposable database,
+sets `EVALDIFF_TEST_POSTGRES_URL` only in the pytest child, and stops the cluster
+in a finally block. It never connects to an existing database. Tests have a
+15-minute outer timeout; termination kills the pytest process group and attempts
+cluster shutdown. Preserve/inspect private diagnostics if cleanup reports failure.
+
+`result.json` records checkout revision/dirty state, hashes of application/test
+inputs, Python/server/driver versions, test command, selection, JUnit totals and
+explicit PostgreSQL parameterized case count. Private `pytest.log`, `junit.xml`,
+and cluster/server logs retain original diagnostics. A dirty checkout result is
+preliminary; rerun affected checks for the reviewed final commit/image and
+require the existing PostgreSQL CI job before release.
+
+The shared API fixture uses a unique PostgreSQL schema whenever this variable
+is set, so ordinary API integration tests now exercise PostgreSQL in that CI
+job. Without it they keep SQLite. Recovery and scheduling suites exercise both
+backends; explicitly SQLite-specific and custom-app tests retain their intended
+backend. The new two-process race covers competing reservations, claims,
+expired-lease recovery, reclaims, settlement idempotency and original-month
+charging. Existing fresh/legacy simultaneous app startup checks prove the
+migration markers and usage totals. These database/process checks do not replace
+a real Docker/Caddy/SeaweedFS staging deployment, notification/restore drills,
+Part C acceptance or release CI.

@@ -3,14 +3,18 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import socket
 import threading
 import time
+from uuid import uuid4
 
 import pytest
 import uvicorn
 from fastapi import FastAPI
+from sqlalchemy import create_engine, text
+from sqlalchemy.engine import make_url
 from starlette.testclient import TestClient
 
 from api.db import state
@@ -78,9 +82,33 @@ def echo_model():
 
 
 @pytest.fixture()
-def client(tmp_path, echo_model):
+def api_database_url(tmp_path):
+    """Use a unique PostgreSQL schema in the PG job; retain SQLite in the default job."""
+    configured = os.environ.get("EVALDIFF_TEST_POSTGRES_URL")
+    if not configured:
+        yield f"sqlite:///{tmp_path}/test.db"
+        return
+    url = make_url(configured)
+    if url.get_backend_name() != "postgresql":
+        raise ValueError("EVALDIFF_TEST_POSTGRES_URL must reference PostgreSQL")
+    schema = "api_" + uuid4().hex
+    admin = create_engine(url, hide_parameters=True)
+    try:
+        with admin.begin() as connection:
+            connection.execute(text(f'CREATE SCHEMA "{schema}"'))
+        yield url.update_query_dict({"options": f"-csearch_path={schema}"}).render_as_string(
+            hide_password=False
+        )
+    finally:
+        with admin.begin() as connection:
+            connection.execute(text(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE'))
+        admin.dispose()
+
+
+@pytest.fixture()
+def client(api_database_url, echo_model):
     settings = Settings(
-        database_url=f"sqlite:///{tmp_path}/test.db",
+        database_url=api_database_url,
         enable_worker=True,
         allow_local_endpoints=True,  # tests use a local echo model (127.0.0.1)
         rate_limit_rpm=0,  # off by default in tests (dedicated tests enable it)

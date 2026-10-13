@@ -276,7 +276,7 @@ qualify a different artifact for release.
   24-hour mixed soak, large-dataset/fairness/fault phases, latency/resource
   gates, six-hour RPO, 60-minute RTO, and backup retention. Targets are
   initial release gates; automation and measured qualification remain pending.
-- [ ] Serialize startup schema creation and migrations. The current migration
+- [x] Serialize startup schema creation and migrations. The current migration
   marker SELECT followed by INSERT requires serialization. Cover
   fresh schema creation, `migrate_legacy_usage`, and the deadline-column
   migration. Both app processes must start successfully, with each migration
@@ -287,11 +287,11 @@ qualify a different artifact for release.
   PostgreSQL advisory lock or SQLite write lock across schema creation and
   both migrations; deadline schema is upgraded before legacy ORM reads.
   Fresh/legacy two-process startup and failure/rollback tests pass on SQLite.
-  PostgreSQL execution remains pending; the existing CI job includes these
-  tests when `EVALDIFF_TEST_POSTGRES_URL` is set. Keep this item open until
-  PostgreSQL validation passes. Local validation: full suite **148 passed,
-  1 skipped**; recovery/startup module **14 passed**; ruff lint/format and
-  whitespace checks passed. Tests ran in an isolated Python 3.13 environment.
+  PostgreSQL 16.15 validation now passes, including fresh/legacy simultaneous
+  startup, one-time migration markers, preserved usage, and rollback. See
+  `deploy/qualification/evidence/POSTGRES-2026-10-13.json`: complete
+  PostgreSQL-enabled suite **242 passed, 1 skipped** on Python 3.13.5.
+  This is local database validation; final-candidate CI/staging remain required.
 - [ ] Add readiness checks for database/storage access and enabled-worker
   health with bounded probe timeouts. Monitor queue age/depth, run failures and
   timeouts, worker heartbeats, memory, and database/storage errors. Define and
@@ -351,15 +351,28 @@ qualify a different artifact for release.
 
 #### D2. Staging and recovery drills
 
-- [ ] Run the complete suite against PostgreSQL using
+- [x] Run the complete suite against PostgreSQL using
   `EVALDIFF_TEST_POSTGRES_URL` and a disposable database. Record the commit,
   database/driver versions, commands, and results. Require the existing
   PostgreSQL CI job, which already gates the build, to pass before release.
-- [ ] Exercise concurrent quota reservations, settlement, month boundaries,
+  Local validation: **242 passed, 1 skipped** against disposable, socket-only
+  PostgreSQL 16.15; Python 3.13.5, psycopg 3.3.6. The shared API fixture now
+  selects an isolated PostgreSQL schema when the test URL is set; recovery and
+  scheduling suites cover both backends. Reproduce with
+  `deploy/qualification/postgres.py`; redacted versions, hashes, commands and
+  counts are in `deploy/qualification/evidence/POSTGRES-2026-10-13.json`.
+  Checkout was dirty; this is preliminary evidence, not a CI/final-image verdict.
+  The existing required CI job remains the release gate and was not run here.
+- [x] Exercise concurrent quota reservations, settlement, month boundaries,
   lease recovery, and legacy migration on PostgreSQL at the intended process
   count. Start two app processes simultaneously against fresh and legacy
   databases; assert both start successfully and migrations run exactly once,
   with correct resulting rows and usage totals.
+  Local PostgreSQL execution passes existing fresh/legacy app startup and
+  scheduling/recovery tests, plus real two-process reservation, exclusive claim,
+  expired-lease recovery, reclaim, idempotent settlement and original-month
+  charging races. Each race has exactly one committed winner. Repeat affected
+  checks for the final reviewed candidate; deployed-stack evidence stays in D2.
 - [ ] Deploy the exact candidate image to isolated staging with PostgreSQL,
   SeaweedFS, Caddy, and production settings. Verify signup, encrypted keys,
   dataset upload, HTTPS model calls, diff/report output, and real client-IP

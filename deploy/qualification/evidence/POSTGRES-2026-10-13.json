@@ -1,0 +1,98 @@
+{
+  "scope": "local_disposable_postgresql",
+  "started_at": 1791916462.7221994,
+  "outcome": "pass",
+  "python": "3.13.5",
+  "revision": "20a7aef38829f55f899e3e9c50946e587cdf6fe3",
+  "checkout_dirty": true,
+  "test_inputs_sha256": {
+    "api/__init__.py": "9448e99456ebeb26559f018200e0207b22b71b335f83a341a75b1d83d9dd16fd",
+    "api/auth.py": "70ce307a0a44d6c3d30fb7bde645458656817ff4d4be09718bbd5f6d811e80e8",
+    "api/build_info.py": "0d5c1dec44924c87c2d7bed66d6bcf0f115a7ab401efd6e39f5e0231666321b3",
+    "api/db.py": "717eb48c71f710a48d31d331d39f3d9a11acc66cad063a5880ff3ae5cd7600f3",
+    "api/diff.py": "58ac02cc961be4553821d27851d50968ffb517510a2126bbbc357312495da88f",
+    "api/http_limits.py": "7e738e197c6711b66be3def0a422c989242268d5e8c19d116262ec2aa61134a2",
+    "api/judges.py": "60e38dbf656784ef9fdca81adde6234fc09a4d402e3dd04e2cedac857f6add84",
+    "api/leases.py": "3b2a974518d849bfcd2d2acffe43cbf6ca1664072bb924edeb5d4fc2b51d2125",
+    "api/main.py": "97c361156b82d541dad7e3d4b8a2c2a11ed0c434d57903fe87d9d2e0c050a4be",
+    "api/migrate_secrets.py": "3bfdeec33f164e4fecadd8bcfe672ae354fab7b3c39e74dd8d58e312e80fb34d",
+    "api/models.py": "9f725e2292c9f1cccbafdb5e3f3772df760cff32e222665f8ff2027da868fdab",
+    "api/operations.py": "77957d95eef7a00ad49b954cee8003342cd0c7964fa78eeda8e1ee99192b765d",
+    "api/operations_probe.py": "1d3fd766a6ee6b69b7e3b3e78756686f0ea916f21db4a52cdff8ffc6b01a5a78",
+    "api/quota.py": "5a9637fcee6f7c0dc1f78de146b42df1ce83df047f57213b4d818c73549c1aea",
+    "api/ratelimit.py": "26810d1626b8e774332c17e3943168168f2e33f1f9218a066575cb2d7d00aad3",
+    "api/runner.py": "d109e7241a874852c10e92a0ad80212f0b4b5a018c64308d22b6afeb4d2193c6",
+    "api/secrets.py": "afcff6663eef23ddf2a59051b25fb7516b604e210a15e77aecf6ad6e1495552b",
+    "api/settings.py": "c5db1a9451a5d16f9859ef53e5b84dade8bf49fef8963133ef1bd933d1d4f3ee",
+    "api/ssrf_guard.py": "68a7cba868541b13f72f88cf78dfb0088d37beafaeb56d64324cf6117e66cfd4",
+    "api/startup.py": "84d1137d1e0091cb6937efdad10354ff910433920acb63f0a27adc610758d9c6",
+    "api/storage.py": "bd3e44580f3b5837995d558da8892f23884e088c0c5b6b50828e41e1efcb71e0",
+    "api/worker.py": "bf13df4ca3375c841414c2c32afd69f8c49fadbcd0cc5bea3db75ae7b364a025",
+    "tests/conftest.py": "1f6a7cb5371031cf5e6957ecbf08fc0f785e93f5e6ebaab7dfe62ba070c5ef71",
+    "tests/test_api.py": "ff001b0f281ee93a842843fd962f201ac4339faa5a372248afd9147826f65c24",
+    "tests/test_backup.py": "d4b21597c49920a82e1fb2ef066a0e85af7f5845eddf0ef91c60356e13c7320c",
+    "tests/test_cli.py": "5bd51fc270bc990dc6d9f824189e2a2007f165c64dde872b3fb1f5fbe95dca89",
+    "tests/test_deployment.py": "8b9a573b5e5409b57866079e528cd9744e6ae672ab0aeab3bec0d031a636db8f",
+    "tests/test_feature_a_regressions.py": "4d3d00c49408864ffb8d9acffe9c7204759c3303ad19f9292d0980b4685ebd2e",
+    "tests/test_hardening.py": "f4d2a69e607e4bebf7295775092fb34df52e207c808403a786a0823943562056",
+    "tests/test_operations.py": "0c03acb588b66194a21d14ef1509ceceed29684c48b12459f9743c5b73073ce4",
+    "tests/test_production_secrets.py": "c4cfa8d4c8ebc908289a192f5bf32da8bec4591cf62c258759ddb8c306360ba2",
+    "tests/test_proxy_limits.py": "e258ef352bda7b7a28335c9bc17012016332bbea69ca9ecd93fea5e9493ba570",
+    "tests/test_qualification.py": "ee2c80c18d4244d09b05de2f9986c8ad42f4e318604cce5a0e52e8b259cb9892",
+    "tests/test_recovery_quota.py": "f415f73b651e2ebcbf167c8b9118eed9aec06cd2e5cfcf506603e2bc513660ea",
+    "tests/test_response_limits.py": "9b104053e0f84f578c6621f00bbac43c10fe55abd72329c7ffc4a746fba3819c",
+    "tests/test_review_fixes.py": "4d1ec9fee5aa1e1030189a909ffb4245eb7b009816797f4cbf69b5403c4d53d2",
+    "tests/test_section_a_followup.py": "e7fd4eac4b52ab6529760f920aa93fc138cb98306257a12fe21a12a3655ae046",
+    "tests/test_worker_scheduling.py": "f29a5b1204a2c05b9ac33f304b08ecc17c8dc07c0a71ee1d7e59db83321d43c1",
+    "deploy/qualification/postgres.py": "f58332926d717d15c0cc8116daa369215e8aec82e596ad9af3bb51a17e97ffd7"
+  },
+  "selection": [
+    "full suite"
+  ],
+  "ci_status": "not_run",
+  "staging_status": "not_run",
+  "postgres_binary": "postgres (PostgreSQL) 16.15",
+  "psycopg": "3.3.6",
+  "sqlalchemy": "2.1.4",
+  "command": [
+    "/tmp/evaldiff-d-startup-venv/bin/python",
+    "-m",
+    "pytest",
+    "-q",
+    "--junitxml=/tmp/evaldiff-pg-full/junit.xml"
+  ],
+  "completed_at": 1791916602.3940504,
+  "counts": {
+    "tests": 243,
+    "failures": 0,
+    "errors": 0,
+    "skipped": 1
+  },
+  "postgresql_parameterized_cases": 33,
+  "postgres_source": {
+    "url": "https://ftp.postgresql.org/pub/source/v16.15/postgresql-16.15.tar.bz2",
+    "sha256": "c1575341fa7bd40f5274ea465b34390f4dc64cdd0770af327005caaeb9f6b7ed",
+    "configure_flags": [
+      "--prefix=/tmp/evaldiff-postgres16/install",
+      "--without-readline",
+      "--without-zlib",
+      "--without-icu"
+    ],
+    "compiler": "gcc (Debian 14.2.0-19) 14.2.0"
+  },
+  "artifacts_sha256": {
+    "junit.xml": "28ab83b8c39ea78ad7677d3018cb7a9ae39e06b8fdf903b853436f0caaee2ab1",
+    "pytest.log": "3b54cede74ea506b1928ed8c3cb2a6b6c62ad6cc247d4f5ad641f87304a97871",
+    "cluster.log": "b86e9a639a0163ddd21436cbbcd18d3dc05b396bf03634dfd5ca8f17c16ef105",
+    "server.log": "3bded68af578d115ff61d3e1322d28dcf0db71941950175f2427fd5e2259fc70"
+  },
+  "private_raw_evidence_directory": "/tmp/evaldiff-pg-full",
+  "libpq": 180006,
+  "shared_api_fixture_backend": "postgresql",
+  "release_qualification": "incomplete; dirty checkout, CI and staging pending",
+  "skipped_case": {
+    "name": "test_account_cap_atomic_across_workers[sqlite]",
+    "reason": "FOR NO KEY UPDATE row locking requires PostgreSQL"
+  },
+  "clean_shutdown_verified": true
+}

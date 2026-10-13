@@ -545,3 +545,144 @@ def test_startup_failure_rolls_back_schema_and_migrations(sessions, monkeypatch)
     assert inspect(engine).get_table_names() == []
     startup.initialize_database(engine)  # rollback must also release the lock
     assert "runs" in inspect(engine).get_table_names()
+
+
+_ACCOUNTING_CHILD = r"""
+import asyncio, json, os, time
+from pathlib import Path
+from sqlalchemy.orm import Session
+from api.db import make_engine
+from api.models import Job, Run
+from api.quota import reserve, settle_run
+from api.worker import enqueue_run, poll_once, recover_abandoned_jobs
+
+engine = make_engine(os.environ['RACE_DB'])
+Path(os.environ['RACE_READY']).touch()
+until = time.monotonic() + 30
+while not Path(os.environ['RACE_GO']).exists():
+    if time.monotonic() > until:
+        raise RuntimeError('barrier_timeout')
+    time.sleep(.01)
+with Session(engine) as session:
+    mode = os.environ['RACE_MODE']
+    if mode == 'reserve':
+        run = Run(account_id=int(os.environ['RACE_ACCOUNT']), dataset_id=int(os.environ['RACE_DATASET']),
+                  model='synthetic', endpoint='https://example.com', total_cases=600)
+        session.add(run)
+        session.flush()
+        value = reserve(session, run_id=run.id, account_id=run.account_id, case_count=600,
+                        period=os.environ['RACE_PERIOD'], quota=1000)
+        if value:
+            enqueue_run(session, run.id)
+        else:
+            session.rollback()
+    elif mode == 'claim':
+        value = asyncio.run(poll_once(session))
+    elif mode == 'recover':
+        value = recover_abandoned_jobs(session)
+    else:
+        run_id = int(os.environ['RACE_RUN'])
+        value = settle_run(session, run_id=run_id, success=True, charged=200)
+        session.get(Run, run_id).status = 'done'
+        session.commit()
+    Path(os.environ['RACE_RESULT']).write_text(json.dumps({'value': value, 'pid': os.getpid()}))
+engine.dispose()
+"""
+
+
+def test_two_process_accounting_claim_recovery_and_settlement(sessions, tmp_path):
+    """Independent connections/processes compete; the parent checks committed winners."""
+    with sessions() as session:
+        account, placeholder = seed(session, count=600)
+        account_id, dataset_id = account.id, placeholder.dataset_id
+        session.delete(placeholder)
+        session.commit()
+    engine = sessions.kw["bind"]
+
+    def race(mode, run_id=0):
+        directory = tmp_path / mode
+        directory.mkdir()
+        go = directory / "go"
+        children = []
+        ready = [directory / f"ready-{index}" for index in range(2)]
+        results = [directory / f"result-{index}.json" for index in range(2)]
+        try:
+            for index in range(2):
+                environment = {
+                    key: value
+                    for key, value in os.environ.items()
+                    if not key.startswith("EVALDIFF_")
+                }
+                environment.update(
+                    RACE_DB=engine.url.render_as_string(hide_password=False),
+                    RACE_MODE=mode.split("-")[0],
+                    RACE_ACCOUNT=str(account_id),
+                    RACE_DATASET=str(dataset_id),
+                    RACE_PERIOD=now_period(),
+                    RACE_RUN=str(run_id),
+                    RACE_READY=str(ready[index]),
+                    RACE_GO=str(go),
+                    RACE_RESULT=str(results[index]),
+                )
+                children.append(
+                    subprocess.Popen(
+                        [sys.executable, "-c", _ACCOUNTING_CHILD],
+                        env=environment,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
+                )
+            until = time.monotonic() + 30
+            while not all(path.exists() for path in ready):
+                assert all(child.poll() is None for child in children), (
+                    "child failed before barrier"
+                )
+                assert time.monotonic() < until, "accounting barrier timed out"
+                time.sleep(0.01)
+            go.touch()
+            for child in children:
+                assert child.wait(timeout=45) == 0, "accounting child failed"
+            rows = [json.loads(path.read_text()) for path in results]
+            assert len({row["pid"] for row in rows}) == 2
+            return [row["value"] for row in rows]
+        finally:
+            for child in children:
+                if child.poll() is None:
+                    child.kill()
+                child.wait(timeout=5)
+
+    assert sorted(race("reserve")) == [False, True]
+    with sessions() as session:
+        run = session.scalar(select(Run))
+        run_id = run.id
+        assert session.query(Job).count() == 1
+        assert used_cases_for(account_id, now_period(), session) == 600
+    assert sum(bool(value) for value in race("claim")) == 1
+    with sessions() as session:
+        job = session.scalar(select(Job))
+        assert job.status == "running" and job.attempts == 1
+        session.execute(
+            update(JobLease).values(expires_at=datetime.now(timezone.utc) - timedelta(seconds=1))
+        )
+        session.commit()
+    assert sorted(race("recover")) == [0, 1]
+    with sessions() as session:
+        job = session.scalar(select(Job))
+        assert job.status == "pending"
+        assert used_cases_for(account_id, now_period(), session) == 600
+    assert sum(bool(value) for value in race("claim-again")) == 1
+    with sessions() as session:
+        assert session.scalar(select(Job)).attempts == 2
+        session.execute(
+            update(RUN_RESERVATIONS)
+            .where(RUN_RESERVATIONS.c.run_id == run_id)
+            .values(period="2000-01")
+        )
+        session.commit()
+    assert sorted(race("settle", run_id)) == [False, True]
+    with sessions() as session:
+        rows = session.execute(select(RUN_RESERVATIONS)).all()
+        assert len(rows) == 1
+        assert rows[0].settled and rows[0].charged == 200 and rows[0].reserved == 600
+        assert used_cases_for(account_id, "2000-01", session) == 200
+        assert used_cases_for(account_id, now_period(), session) == 0
