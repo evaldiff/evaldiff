@@ -117,3 +117,17 @@ Follow [the upgrade guide](deploy/UPGRADING.md#production-credential-encryption-
 for key provisioning, the offline `python -m api.migrate_secrets` command,
 backup restoration, and rotation. The deployment image builds the checked-out
 source; use the full repository checkout when deploying.
+
+### Running tests from source
+
+Install the test dependencies before running the suite:
+
+```sh
+pip install -e '.[test]'
+pytest -q
+```
+
+For PostgreSQL coverage, also install `psycopg[binary]>=3.1` and set
+`EVALDIFF_TEST_POSTGRES_URL` to a disposable PostgreSQL database. See
+[the qualification runbook](deploy/qualification/README.md) for the isolated
+PostgreSQL runner and staging scenarios.

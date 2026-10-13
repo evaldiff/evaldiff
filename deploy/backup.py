@@ -28,7 +28,10 @@ def private_json(path):
 
 def digest(path):
     with Path(path).open("rb") as source:
-        return hashlib.file_digest(source, "sha256").hexdigest()
+        checksum = hashlib.sha256()
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            checksum.update(chunk)
+        return checksum.hexdigest()
 
 
 def write_json(path, value):

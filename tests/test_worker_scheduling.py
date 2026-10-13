@@ -637,16 +637,11 @@ def test_stalled_dataset_read_fails_run(sessions, monkeypatch):
 
 
 def test_stalled_writes_cannot_exhaust_pool(sessions, monkeypatch):
-    """P2: repeated stalled writes must not consume an unbounded number
-    of threads. With a pool of ONE storage thread, two concurrent runs
-    whose writes each stall for 2.5s cannot run their writes in parallel
-    — the second waits at admission (BEFORE the executor queue), so at
-    most ONE write thread is ever live. An unbounded pool
-    (asyncio.to_thread) would have two live threads at once.
+    """Hold one storage writer until another run exhausts its admission budget.
 
-    Also pins the deadline semantics for the queued case: the run whose
-    write could not get a slot before its budget ran out is failed and
-    refunded, not charged."""
+    The blocked run must fail/refund while the first writer retains the only
+    pool slot. Explicit events establish the overlap across Python versions.
+    """
     # One storage thread + fresh pool/gate (other tests may have created
     # their own).
     import api.runner as runner_module
@@ -658,6 +653,8 @@ def test_stalled_writes_cannot_exhaust_pool(sessions, monkeypatch):
     live = 0
     peak = 0
     lock = threading.Lock()
+    write_entered = threading.Event()
+    release_write = threading.Event()
 
     class BoundedStorage(InMemoryStorage):
         def _track(self, fn):
@@ -673,14 +670,15 @@ def test_stalled_writes_cannot_exhaust_pool(sessions, monkeypatch):
 
         def get_json(self, key: str) -> object:
             def _get():
-                time.sleep(1.5)
                 return [{"input": "x", "expected": "x"}]
 
             return self._track(_get)
 
         def put_json(self, key: str, obj: object) -> str:
             def _put():
-                time.sleep(2.5)  # longer than the budget left for the queued run
+                write_entered.set()
+                if not release_write.wait(timeout=15):
+                    raise RuntimeError("test storage writer was not released")
                 return key
 
             return self._track(_put)
@@ -689,27 +687,29 @@ def test_stalled_writes_cannot_exhaust_pool(sessions, monkeypatch):
     monkeypatch.setattr(state, "storage", storage)
     monkeypatch.setattr("api.runner.call_model", fake_model(sessions))
 
-    # deadline=6: run A's 1.5s read + 2.5s write land inside its budget;
-    # run B is serialised behind A on the single pool thread, so its
-    # write starts after A's and lands past its own deadline — failed +
-    # refunded. (Both exceed a 3s budget, so 6 is the tight working value.)
-    aid_a, rid_a = seed_storage_dataset(sessions, deadline=6)
-    aid_b, rid_b = seed_storage_dataset(sessions, deadline=6)
+    aid_a, rid_a = seed_storage_dataset(sessions, deadline=30)
 
     async def drive():
-        a = asyncio.wait_for(execute_run(rid_a), timeout=20)
-        b = asyncio.wait_for(execute_run(rid_b), timeout=20)
-        return await asyncio.gather(a, b, return_exceptions=True)
+        first = asyncio.create_task(execute_run(rid_a))
+        try:
+            assert await asyncio.to_thread(write_entered.wait, 5), (
+                "first storage write did not start"
+            )
+            # Reserve B's budget only after A demonstrably holds the pool slot.
+            aid_b, rid_b = seed_storage_dataset(sessions, deadline=2)
+            await asyncio.wait_for(execute_run(rid_b), timeout=5)
+            return aid_b, rid_b
+        finally:
+            release_write.set()
+            await asyncio.wait_for(first, timeout=10)
 
-    asyncio.run(drive())
+    aid_b, rid_b = asyncio.run(drive())
 
     with sessions() as session:
         run_a = session.get(Run, rid_a)
         run_b = session.get(Run, rid_b)
-        statuses = sorted([run_a.status, run_b.status])
-        # With one thread and a 2.5s write, exactly one run can finish its
-        # write inside its 6s budget; the other is failed + refunded.
-        assert statuses == ["done", "failed"], f"expected one done + one failed, got {statuses}"
+        assert run_a.status == "done"
+        assert run_b.status == "failed"
         for aid, run in ((aid_a, run_a), (aid_b, run_b)):
             if run.status == "failed":
                 assert "deadline" in (run.error or "").lower()

@@ -176,18 +176,22 @@ class Harness:
         headers = {"Authorization": "Bearer " + account["key"]} if account else {}
         code, content = 0, b""
         isolated = False
+
+        async def read_response():
+            nonlocal code, content, isolated
+            async with self.client.stream(method, path, json=body, headers=headers) as response:
+                code = response.status_code
+                isolated = (
+                    response.headers.get("X-Evaldiff-Staging-Project") == self.config["project"]
+                )
+                async for chunk in response.aiter_bytes():
+                    content += chunk
+                    if len(content) > 8 * 1024**2:
+                        raise QualificationError("response_limit")
+
         try:
-            async with asyncio.timeout(REQUEST_TIMEOUT):
-                async with self.client.stream(method, path, json=body, headers=headers) as response:
-                    code = response.status_code
-                    isolated = (
-                        response.headers.get("X-Evaldiff-Staging-Project") == self.config["project"]
-                    )
-                    async for chunk in response.aiter_bytes():
-                        content += chunk
-                        if len(content) > 8 * 1024**2:
-                            raise QualificationError("response_limit")
-        except (httpx.HTTPError, QualificationError, TimeoutError):
+            await asyncio.wait_for(read_response(), timeout=REQUEST_TIMEOUT)
+        except (httpx.HTTPError, QualificationError, asyncio.TimeoutError):
             code = 0
         elapsed = time.monotonic() - started
         self.record(
@@ -533,7 +537,7 @@ class Harness:
                 self.record("resource_sample_late", seconds=duration)
             try:
                 await asyncio.wait_for(stop.wait(), timeout=max(0.01, 5 - duration))
-            except TimeoutError:
+            except asyncio.TimeoutError:
                 continue
 
     async def load(self, phase):
