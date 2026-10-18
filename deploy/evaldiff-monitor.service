@@ -7,7 +7,8 @@ Requires=docker.service
 Type=simple
 User=deploy
 WorkingDirectory=/home/deploy/evaldiff/deploy
-EnvironmentFile=/home/deploy/evaldiff/deploy/.env
+# No EnvironmentFile on purpose (P2 2026-10-18): the monitor needs no
+# application secrets; it probes the public /ops endpoint and local resources.
 ExecStart=/usr/bin/python3 /home/deploy/evaldiff/deploy/monitor.py --loop --volume-path /var/lib/docker --backup-status /var/lib/evaldiff-backup/status.json
 Restart=on-failure
 RestartSec=5

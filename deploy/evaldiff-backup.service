@@ -7,7 +7,9 @@ Requires=docker.service
 Type=oneshot
 User=deploy
 WorkingDirectory=/home/deploy/evaldiff/deploy
-EnvironmentFile=/home/deploy/evaldiff/deploy/.env
+# No EnvironmentFile on purpose (P2 2026-10-18): this process never reads the
+# application .env. Backup keys come from the api container via `docker exec`,
+# and restic repository/password settings come from /etc/evaldiff-backup/config.json.
 ExecStart=/usr/bin/python3 /home/deploy/evaldiff/deploy/backup.py --config /etc/evaldiff-backup/config.json
 TimeoutStartSec=55min
 TimeoutStopSec=3min

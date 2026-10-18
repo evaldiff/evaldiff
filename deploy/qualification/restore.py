@@ -169,7 +169,23 @@ async def restore(args):
                     input=source,
                     timeout=900,
                 )
-            script = "import tarfile,sys;t=tarfile.open(fileobj=sys.stdin.buffer,mode='r|');t.extractall('/target',filter='data')"
+            # Python 3.11-compatible extraction with a 3.12 `data`-style safety
+            # filter (the runbooks promise 3.11+ hosts; see P3 2026-10-18).
+            script = (
+                "import tarfile,sys\n"
+                "t=tarfile.open(fileobj=sys.stdin.buffer,mode='r|')\n"
+                "def safe(m,p):\n"
+                "    n=m.name.lstrip('/')\n"
+                "    if '..' in n.split('/') or m.issym() or m.islnk():\n"
+                "        raise ValueError('unsafe member')\n"
+                "    return m\n"
+                "try:\n"
+                "    t.extractall('/target',filter=safe)\n"
+                "except TypeError:\n"
+                "    for m in t.getmembers():\n"
+                "        safe(m,'')\n"
+                "        t.extract(m)\n"
+            )
             with (manifest_path.parent / "objects.tar").open("rb") as source:
                 harness.command(
                     [
