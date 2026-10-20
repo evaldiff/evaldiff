@@ -1,8 +1,8 @@
 [Unit]
-Description=evaldiff backup every four hours with RPO completion slack
+Description=evaldiff daily backup (03:00 UTC)
 
 [Timer]
-OnCalendar=*-*-* 00,04,08,12,16,20:00:00 UTC
+OnCalendar=*-*-* 03:00:00 UTC
 Persistent=true
 Unit=evaldiff-backup.service
 
