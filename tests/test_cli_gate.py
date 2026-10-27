@@ -9,6 +9,7 @@ invalid-comparison rejections, report writing, and the exit-code contract.
 from __future__ import annotations
 
 import re
+import time
 
 import httpx
 import pytest
@@ -407,6 +408,43 @@ def test_inflight_status_call_bounded_by_deadline(mock_api):
     assert r.exit_code == 0, r.output
     assert mock_api.status_timeouts, "no status polls captured"
     assert all(t <= 1.1 for t in mock_api.status_timeouts), mock_api.status_timeouts
+
+
+def test_late_response_after_deadline_never_passes(mock_api):
+    # A response that lands after the deadline — e.g. a server trickling
+    # data slowly past the per-request timeout — must not turn the gate
+    # green: the deadline is a wall-clock budget, and a timeout is never a
+    # pass.
+    mock_api.runs[41] = _run_out(41, "done", 2, 2)
+    gw = cli._gateway()
+    orig = gw.request
+
+    def slow_request(method, path, **kw):
+        if method == "GET":
+            time.sleep(1.2)  # land the response past --deadline 1
+        return orig(method, path, **kw)
+
+    gw.request = slow_request
+    r = _invoke(
+        [
+            "run",
+            "--key",
+            "k",
+            "--dataset-id",
+            "7",
+            "--endpoint",
+            "http://x/v1",
+            "--model",
+            "m",
+            "--deadline",
+            "1",
+            "--poll",
+            "0.5",
+        ]
+    )
+    assert r.exit_code == 2, r.output
+    flat = re.sub(r"\s+", " ", r.output)
+    assert "deadline exceeded" in flat
 
 
 def test_poll_get_still_retries_5xx(mock_api):

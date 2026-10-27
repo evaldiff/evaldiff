@@ -138,6 +138,11 @@ Groq, Together, Ollama, vLLM, LM Studio. Everything else: bring your own adapter
 
 ## Status
 
+- `0.0.23` — fixes: `--deadline` is now a true wall-clock budget — a
+  successful response is re-checked against the deadline before being
+  accepted, so a slowly-trickling server can no longer land a "pass" after
+  the deadline; OPERATIONS.md backup-activation section no longer quotes the
+  old 4h/six-hour schedule
 - `0.0.22` — fixes: backups run twice daily (03:00 + 15:00 UTC) so the 24h
   RPO holds end-to-end including capture/verification slack; OPERATIONS.md
   retention now matches backup.py exactly (all points 7d, daily 30d, weekly

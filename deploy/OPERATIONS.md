@@ -359,8 +359,9 @@ Create `/var/lib/evaldiff-backup` and its `staging` child owned by `deploy`, mod
 verification copy. Size retained off-host capacity using the policy above and
 25% headroom before activation. Copy the service/timer templates to systemd,
 adjust checkout/user paths, run one manual service invocation, inspect its
-status/journal, and only then enable the timer. The timer runs every four hours,
-leaving completion slack for the six-hour RPO. Runs have a 50-minute command
+status/journal, and only then enable the timer. The timer runs twice daily
+(03:00 + 15:00 UTC), leaving completion slack for the 24-hour RPO. Runs have
+a 50-minute command
 budget; systemd supplies a 55-minute outer limit and three minutes for recovery.
 Only one backup may run at a time. **Do not deploy, rotate keys, restart services,
 or run other database/object writers during capture.** The single-writer

@@ -196,8 +196,11 @@ def call(
       * every other 4xx → terminal (auth, validation, quota-at-enqueue,
         409 comparison conflicts...).
       * in-flight requests are capped at the remaining deadline (and at
-        REQUEST_TIMEOUT): a stalled status call can never run past
-        ``--deadline`` or land a result after it.
+        REQUEST_TIMEOUT), and a successful response is re-checked against the
+        wall-clock deadline before being accepted: the httpx timeout bounds
+        single operations (inactivity between reads), not total elapsed time,
+        so a server trickling data slowly can still exceed ``--deadline`` —
+        a late decision is a timeout, never a pass.
     Never loops past the deadline, never turns an error into success.
     """
     wait = backoff_start
@@ -207,7 +210,7 @@ def call(
             raise DeadlineExceeded(path)
         remaining = deadline - time.monotonic()
         try:
-            return gw.request(
+            resp = gw.request(
                 method,
                 path,
                 params=params,
@@ -225,6 +228,16 @@ def call(
         except httpx.TransportError:
             if not idempotent:
                 raise _uncertain_create(None)
+        else:
+            # Success: enforce the wall-clock budget before accepting the
+            # response. The httpx timeout bounds single network operations
+            # (inactivity between reads), not total elapsed time — a server
+            # that trickles data slowly can exceed the deadline and still
+            # return a response. The deadline is a wall-clock budget: a
+            # decision that lands after it is a timeout, never a pass.
+            if time.monotonic() >= deadline:
+                raise DeadlineExceeded(path)
+            return resp
         _sleep_bounded(wait, deadline)
         wait = min(wait * 2, backoff_max)
 
