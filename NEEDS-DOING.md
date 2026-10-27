@@ -415,17 +415,21 @@ blocks final qualification.
 Files: `evaldiff_cli/main.py`, `tests/test_cli.py`, `api/main.py`, `api/diff.py`,
 `api/storage.py`, `README.md`. Can proceed alongside A–D.
 
-- [ ] Implement `evaldiff run` with authentication, dataset upload, submission,
+- [x] Implement `evaldiff run` with authentication, dataset upload, submission,
   bounded polling, rate-limit handling, and useful progress/error messages.
-- [ ] Implement `evaldiff diff` with the API's comparison requirements. Define
+  (0.0.20, 2026-10-27)
+- [x] Implement `evaldiff diff` with the API's comparison requirements. Define
   and document stable exit codes: 0 for a passing evaluation/gate, 1 for a
   failed evaluation/regression, and 2 for operational or usage errors.
   Incomplete/failed runs and polling timeouts must never produce a green gate.
-- [ ] Include input, expected answer, actual output, and judge explanation in
+  (0.0.20, 2026-10-27)
+- [x] Include input, expected answer, actual output, and judge explanation in
   authorized JSON/Markdown reports. Persist evidence across restarts, including
   deployments without S3; bound report size and preserve account isolation.
-- [ ] Align README commands, authentication setup, threshold semantics, and
+  (0.0.20: LocalStorage + evidence endpoints)
+- [x] Align README commands, authentication setup, threshold semantics, and
   version output with the implementation. Clearly label npm's stub status.
+  (0.0.20, 2026-10-27)
 - [ ] Extend the forkable demo and action usage guide with a complete CLI
   example: passing baseline, deliberate regression, failing gate, and report.
 

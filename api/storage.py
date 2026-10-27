@@ -8,6 +8,9 @@ R2) works. When S3 is unset, datasets are stored inline in Postgres.
 from __future__ import annotations
 
 import json
+import os
+import pathlib
+import threading
 from functools import wraps
 
 
@@ -134,6 +137,62 @@ class S3Storage(Storage):
         )
 
 
+class LocalStorage(Storage):
+    """Filesystem-backed storage for deployments without S3 (Part E).
+
+    Evidence (case outputs, large datasets) must survive process restarts
+    even when no S3 endpoint is configured; InMemoryStorage loses it on
+    every restart. Files are written atomically (temp file + rename) so a
+    crashed write never leaves a truncated object, and every read is
+    bounded by a byte cap so a corrupt/huge object cannot blow up a
+    report request.
+    """
+
+    DEFAULT_MAX_BYTES = 64 * 1024 * 1024  # 64 MiB per object
+
+    def __init__(self, root_dir: str, max_bytes: int = DEFAULT_MAX_BYTES) -> None:
+        self.root = pathlib.Path(root_dir).expanduser().resolve()
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.max_bytes = max_bytes
+
+    def _path(self, key: str) -> pathlib.Path:
+        if not key or key.startswith("/") or "\x00" in key:
+            raise ValueError("invalid storage key")
+        p = (self.root / key).resolve()
+        if p != self.root and self.root not in p.parents:
+            raise ValueError("storage key escapes the storage root")
+        return p
+
+    @observed_operation
+    def put_json(self, key: str, obj: object) -> str:
+        body = json.dumps(obj, ensure_ascii=False).encode()
+        if len(body) > self.max_bytes:
+            raise ValueError(f"object exceeds the {self.max_bytes}-byte storage limit")
+        p = self._path(key)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.parent / f".{p.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+        try:
+            tmp.write_bytes(body)
+            os.replace(tmp, p)  # atomic on POSIX: readers never see a partial file
+        except BaseException:
+            tmp.unlink(missing_ok=True)
+            raise
+        return key
+
+    @observed_operation
+    def get_json(self, key: str) -> object:
+        p = self._path(key)
+        if not p.is_file():
+            raise KeyError(key)
+        if p.stat().st_size > self.max_bytes:
+            raise ValueError(f"object exceeds the {self.max_bytes}-byte storage limit")
+        return json.loads(p.read_bytes().decode())
+
+    @observed_operation
+    def presigned_put_url(self, key: str, expires_in: int = 900) -> str:
+        raise NotImplementedError("no presigned URLs with local storage")
+
+
 def build_storage(settings) -> Storage:
     if settings.s3_endpoint:
         return S3Storage(
@@ -144,4 +203,6 @@ def build_storage(settings) -> Storage:
             region=settings.s3_region,
             timeout=float(getattr(settings, "storage_timeout", 0.0)),
         )
+    if getattr(settings, "storage_dir", None):
+        return LocalStorage(settings.storage_dir)
     return InMemoryStorage()

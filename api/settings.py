@@ -24,6 +24,12 @@ class Settings(BaseSettings):
     s3_bucket: str = "evaldiff"
     s3_region: str = "eu-central-1"
 
+    # Filesystem-backed storage (Part E): when set, case outputs and
+    # storage-backed objects persist to this directory across restarts —
+    # the evidence path for deployments WITHOUT S3. Empty (default) =
+    # in-memory storage (dev/ephemeral). S3 always wins when configured.
+    storage_dir: str | None = None
+
     public_base_url: str = "http://localhost:8000"
     default_quota: int = 1000
     enable_worker: bool = True

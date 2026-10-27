@@ -75,6 +75,7 @@ class RunOut(BaseModel):
     id: int
     status: str
     model: str
+    dataset_id: int
     total_cases: int
     passed_cases: int
     avg_score: float | None
@@ -104,6 +105,7 @@ def _run_out(run: Run) -> RunOut:
         id=run.id,
         status=run.status,
         model=run.model,
+        dataset_id=run.dataset_id,
         total_cases=run.total_cases,
         passed_cases=run.passed_cases,
         avg_score=run.avg_score,
@@ -338,6 +340,33 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         )
 
     # ---------- runs ----------
+    @app.get("/v1/datasets/{ds_id}/cases")
+    def get_dataset_cases(
+        ds_id: int,
+        account: Account = Depends(get_current_account),
+        session: Session = Depends(get_session),
+    ) -> dict:
+        """The dataset's cases (input/expected/rubric) — report evidence.
+
+        Served inline from the DB, or from storage when the dataset was
+        offloaded (S3/SeaweedFS or local disk). Account-scoped: other
+        accounts' datasets are 404 (no existence leakage).
+        """
+        ds = session.get(Dataset, ds_id)
+        if ds is None or ds.account_id != account.id:
+            raise HTTPException(404, "dataset not found")
+        cases = None
+        if ds.cases_json:
+            cases = json.loads(ds.cases_json)
+        elif ds.storage_key and state.storage is not None:
+            try:
+                cases = state.storage.get_json(ds.storage_key)
+            except Exception as exc:  # noqa: BLE001 - storage backends raise assorted types
+                raise HTTPException(502, f"dataset content unavailable: {exc}")
+        if cases is None:
+            raise HTTPException(500, "dataset has no readable cases")
+        return {"id": ds.id, "name": ds.name, "case_count": len(cases), "cases": cases}
+
     @app.post("/v1/runs", response_model=RunOut, status_code=status.HTTP_202_ACCEPTED)
     def create_run(
         body: RunIn,
@@ -460,6 +489,43 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             for c in sorted(run.cases, key=lambda c: c.seq)
         ]
 
+    @app.get("/v1/runs/{run_id}/cases/{seq}/output")
+    def get_case_output(
+        run_id: int,
+        seq: int,
+        account: Account = Depends(get_current_account),
+        session: Session = Depends(get_session),
+    ) -> dict:
+        """One case's evidence: actual model output + judge verdict (Part E).
+
+        404 when the case has no persisted output (storage was disabled
+        or the case errored before the write) — callers must treat that
+        as 'no evidence', never as a pass. 502 when storage is unreachable.
+        """
+        run = _get_own_run(session, run_id, account)
+        case = next((c for c in run.cases if c.seq == seq), None)
+        if case is None:
+            raise HTTPException(404, "case not found in this run")
+        if not case.output_key:
+            raise HTTPException(404, "case output was not persisted for this run")
+        if state.storage is None:
+            raise HTTPException(502, "case output unavailable: storage not configured")
+        try:
+            payload = state.storage.get_json(case.output_key)
+        except Exception as exc:  # noqa: BLE001 - storage backends raise assorted types
+            raise HTTPException(502, f"case output unavailable: {exc}")
+        score = payload.get("score") or {}
+        return {
+            "seq": seq,
+            "output": payload.get("output"),
+            "score": {
+                "score": score.get("score"),
+                "passed": score.get("passed"),
+                "detail": score.get("detail"),
+                "raw": score.get("raw"),
+            },
+        }
+
     # ---------- diff + report ----------
     @app.get("/v1/runs/{run_id}/diff")
     def diff_runs(
@@ -471,7 +537,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         # diff semantics: run_id = NEW run (B), compare = BASE run (A)
         run_b = _get_own_run(session, run_id, account)
         run_a = _get_own_run(session, compare, account)
-        d = _validated_diff(session, run_a, run_b)
+        try:
+            d = _validated_diff(session, run_a, run_b)
+        except ValueError as exc:
+            # Domain conflict (not done yet / different datasets) — a stable
+            # 409 the CLI maps to exit code 2, never to a green gate.
+            raise HTTPException(409, str(exc))
         d.cases.sort(key=lambda c: c.seq)
         return {
             "summary": d.summary,
@@ -492,7 +563,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         else:
             # diff semantics: run_id = NEW run (B), compare = BASE run (A)
             run_a = _get_own_run(session, compare, account)
-            md = diff_to_markdown(_validated_diff(session, run_a, run))
+            try:
+                d = _validated_diff(session, run_a, run)
+            except ValueError as exc:
+                raise HTTPException(409, str(exc))
+            md = diff_to_markdown(d)
         return Response(content=md, media_type="text/markdown")
 
     # ---------- usage ----------
