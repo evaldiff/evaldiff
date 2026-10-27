@@ -32,7 +32,8 @@ def test_private_manifest_and_stale_alerts(tmp_path):
     path = tmp_path / "status.json"
     write_json(path, {"last_success": 100, "outcome": "failed"})
     assert path.stat().st_mode & 0o077 == 0
-    assert [x["code"] for x in backup_alerts(path, 21700)] == ["backup_failed", "backup_stale"]
+    # now=86500 with last_success=100 → exactly 24h elapsed (current threshold)
+    assert [x["code"] for x in backup_alerts(path, 86500)] == ["backup_failed", "backup_stale"]
     assert backup_alerts(tmp_path / "missing")[0]["code"] == "backup_status_unavailable"
 
 
