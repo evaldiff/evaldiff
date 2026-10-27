@@ -142,10 +142,11 @@ def backup_alerts(path, now=None):
         result = []
         if status.get("outcome") == "failed":
             result.append({"code": "backup_failed", "severity": "critical"})
-        # Backup runs DAILY (03:00 UTC timer); a 24h threshold flags a backup
-        # as stale only once a full daily cycle has passed without success.
-        # (A shorter threshold false-alarms most of every day: 2026-10-27
-        # 6h threshold vs daily schedule → 18h/day of critical noise.)
+        # Backup runs twice daily (03:00/15:00 UTC timers); the 24h threshold
+        # flags a backup as stale only once two full cycles have passed
+        # without success, so a running job or a single missed cycle never
+        # false-alarms. (2026-10-27: 6h threshold vs daily schedule →
+        # 18h/day of critical noise.)
         if now - float(status.get("last_success", 0)) >= 24 * 3600:
             result.append({"code": "backup_stale", "severity": "critical"})
         if status.get("outcome") == "running" and now - float(status["attempt_started"]) > 55 * 60:

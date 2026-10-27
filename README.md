@@ -138,6 +138,11 @@ Groq, Together, Ollama, vLLM, LM Studio. Everything else: bring your own adapter
 
 ## Status
 
+- `0.0.22` — fixes: backups run twice daily (03:00 + 15:00 UTC) so the 24h
+  RPO holds end-to-end including capture/verification slack; OPERATIONS.md
+  retention now matches backup.py exactly (all points 7d, daily 30d, weekly
+  84d); CLI `--deadline` now constrains in-flight requests, not only the
+  poll loop — a stalled status call can no longer run past the deadline
 - `0.0.21` — fixes: reports work with normal datasets (API assigns `seq`;
   CLI falls back to list position), file-based workflow stays comparable
   (quickstart + hints for `--dataset-id`), creation requests are no longer

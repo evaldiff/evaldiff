@@ -1,8 +1,9 @@
 [Unit]
-Description=evaldiff daily backup (03:00 UTC)
+Description=evaldiff backup (03:00 + 15:00 UTC)
 
 [Timer]
 OnCalendar=*-*-* 03:00:00 UTC
+OnCalendar=*-*-* 15:00:00 UTC
 Persistent=true
 Unit=evaldiff-backup.service
 

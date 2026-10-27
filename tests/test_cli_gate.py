@@ -48,6 +48,9 @@ class MockAPI:
         self.raise_transport: dict[str, int] = {}
         # Calls per "METHOD /path" — proves creation requests are not retried
         self.request_counts: dict[str, int] = {}
+        # Per-request read timeouts (s) on run-status polls — proves the
+        # deadline constrains in-flight requests, not only pre-request checks
+        self.status_timeouts: list[float] = []
 
     def handler(self, request: httpx.Request) -> httpx.Response:
         m, p = request.method, request.url.path
@@ -74,6 +77,9 @@ class MockAPI:
             parts = p.split("/")
             rid = int(parts[3])
             if len(parts) == 4 and rid in self.runs:
+                t = request.extensions.get("timeout")
+                if isinstance(t, dict):
+                    self.status_timeouts.append(float(t.get("read", 0.0)))
                 return httpx.Response(200, json=self.runs[rid])
             if len(parts) == 4:
                 return httpx.Response(404, json={"detail": "run not found"})
@@ -99,7 +105,11 @@ class MockAPI:
 @pytest.fixture
 def mock_api(monkeypatch):
     api = MockAPI()
-    gw = cli.Gateway("http://mock", transport=httpx.MockTransport(api.handler), timeout=1.0)
+    # Client default mirrors production (REQUEST_TIMEOUT); the deadline-based
+    # per-request cap under test must beat this default.
+    gw = cli.Gateway(
+        "http://mock", transport=httpx.MockTransport(api.handler), timeout=cli.REQUEST_TIMEOUT
+    )
     monkeypatch.setattr(cli, "_gateway", lambda *a, **k: gw)
     return api
 
@@ -370,6 +380,33 @@ def test_run_post_transport_error_not_retried(mock_api):
     flat = re.sub(r"\s+", " ", r.output)  # console wraps + indents long lines
     assert "transport error" in flat
     assert mock_api.request_counts.get("POST /v1/runs") == 1
+
+
+def test_inflight_status_call_bounded_by_deadline(mock_api):
+    # The deadline must constrain the in-flight request itself: with
+    # --deadline 1 a stalling status call must not use the client's fixed
+    # 30s timeout, and no response may land after the deadline.
+    mock_api.runs[41] = _run_out(41, "done", 2, 2)
+    r = _invoke(
+        [
+            "run",
+            "--key",
+            "k",
+            "--dataset-id",
+            "7",
+            "--endpoint",
+            "http://x/v1",
+            "--model",
+            "m",
+            "--deadline",
+            "1",
+            "--poll",
+            "0.5",
+        ]
+    )
+    assert r.exit_code == 0, r.output
+    assert mock_api.status_timeouts, "no status polls captured"
+    assert all(t <= 1.1 for t in mock_api.status_timeouts), mock_api.status_timeouts
 
 
 def test_poll_get_still_retries_5xx(mock_api):

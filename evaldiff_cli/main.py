@@ -108,8 +108,12 @@ class Gateway:
         *,
         params: dict[str, Any] | None = None,
         json_body: dict[str, Any] | None = None,
+        timeout: float | None = None,
     ) -> httpx.Response:
-        resp = self._client.request(method, path, params=params, json=json_body)
+        kwargs: dict[str, Any] = {"params": params, "json": json_body}
+        if timeout is not None:  # None would mean "no timeout" in httpx
+            kwargs["timeout"] = timeout
+        resp = self._client.request(method, path, **kwargs)
         if resp.status_code >= 400:
             raise ApiError(resp.status_code, _detail(resp), _retry_after(resp))
         return resp
@@ -191,6 +195,9 @@ def call(
         fail with exit 2 and tell the operator to check before retrying.
       * every other 4xx → terminal (auth, validation, quota-at-enqueue,
         409 comparison conflicts...).
+      * in-flight requests are capped at the remaining deadline (and at
+        REQUEST_TIMEOUT): a stalled status call can never run past
+        ``--deadline`` or land a result after it.
     Never loops past the deadline, never turns an error into success.
     """
     wait = backoff_start
@@ -198,8 +205,15 @@ def call(
     while True:
         if time.monotonic() >= deadline:
             raise DeadlineExceeded(path)
+        remaining = deadline - time.monotonic()
         try:
-            return gw.request(method, path, params=params, json_body=json_body)
+            return gw.request(
+                method,
+                path,
+                params=params,
+                json_body=json_body,
+                timeout=max(min(REQUEST_TIMEOUT, remaining), 0.05),
+            )
         except ApiError as e:
             if e.status == 429:
                 wait = max(wait, min(e.retry_after or wait, backoff_max))

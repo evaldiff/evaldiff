@@ -148,24 +148,26 @@ persisted deadline plus 180 seconds fails qualification.
 
 ### Backup and recovery objectives
 
-- Create a coordinated database/object-storage recovery point daily (03:00 UTC
-  timer). Maximum interval between successful recovery points is 24 hours. To
-  avoid inconsistent dataset references, pause submissions and drain/stop
-  writers before capturing both stores; a future online scheme must prove
-  equivalent consistency. Record pause duration and backup start/completion
-  timestamps.
-- Keep daily recovery points for seven days, one weekly point for
-  30 days, and one monthly point for 12 weeks. Deduplicate overlapping retention
-  selections. Backups must be encrypted, off-host, and checksummed; a point is
-  successful only after both stores and its manifest are verified off-host.
+- Create a coordinated database/object-storage recovery point twice daily
+  (03:00 and 15:00 UTC timers). Maximum interval between successful recovery
+  points is 12 hours. To avoid inconsistent dataset references, pause
+  submissions and drain/stop writers before capturing both stores; a future
+  online scheme must prove equivalent consistency. Record pause duration and
+  backup start/completion timestamps.
+- Retention matches backup.py exactly: keep all points within seven days,
+  one point per day for 30 days, and one point per week for 84 days
+  (12 weeks); restic deduplicates overlapping selections. Backups must be
+  encrypted, off-host, and checksummed; a point is successful only after both
+  stores and its manifest are verified off-host.
 - Back up encryption keys separately when provisioned or rotated. Retain every
   required key for as long as a retained recovery point needs it. Manifests
   contain key identifiers, never key values, and include the commit/image digest
   and compatible restore version.
 - RPO: at most 24 hours of lost acknowledged writes. Measure incident time
   against the restored point's consistency timestamp. Backup completion delay
-  counts against RPO; choose scheduling slack or shorten cadence if necessary
-  to keep the latest usable point within the objective.
+  counts against RPO: captures are 12 hours apart, so completing and
+  verifying a point keeps at least 12 hours of slack inside the objective
+  (a daily cadence could not guarantee 24h end-to-end).
 - RTO: at most 60 minutes from declaring recovery to an isolated restored stack
   passing readiness, credential decryption, dataset/report access, and a queued
   evaluation. Include downloading backups, provisioning, and key retrieval.
@@ -383,7 +385,7 @@ objects and manifest are uploaded together to the data repository and downloaded
 again with `restic restore --verify`; explicit file digests must also match.
 Only then is the snapshot tagged `verified`. Retention selects verified data
 points by stable deployment host (not temporary capture paths), keeping all
-points within seven days, weekly points within 30 days and monthly points
+points within seven days, daily points within 30 days and weekly points
 within 84 days; restic deduplicates overlapping selections. Pruning follows retention.
 Key snapshots are never automatically expired or pruned: retire them manually
 only after proving no retained data point needs them. Pending/unverified
