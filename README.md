@@ -52,13 +52,24 @@ export EVALDIFF_API_KEY=eval_...
 evaldiff init --name my-dataset
 
 # 3) Gate it: upload, run, poll to completion, exit 0/1/2
+#    NOTE: each `--dataset FILE` upload creates a NEW dataset — remember the
+#    printed dataset id so the next run can target the same one.
 evaldiff run --dataset my-dataset.json \
              --endpoint https://your-openai-compatible/v1 \
              --model your-model \
              --model-key $YOUR_MODEL_KEY \
              --threshold 0.85
+# → "uploaded dataset my-dataset (2 cases) → id 42"
 
-# 4) Compare two runs; exit 1 on any regression
+# 4) Gate a change against the SAME dataset (this keeps runs comparable)
+evaldiff run --dataset-id 42 \
+             --endpoint https://your-openai-compatible/v1 \
+             --model your-model \
+             --model-key $YOUR_MODEL_KEY \
+             --threshold 0.85
+
+# 5) Compare the two runs; exit 1 on any regression
+#    (diff rejects runs on different datasets)
 evaldiff diff --base <runA-id> --new <runB-id>
 
 # Reports with per-case evidence (input / expected / actual / judge)
@@ -127,6 +138,11 @@ Groq, Together, Ollama, vLLM, LM Studio. Everything else: bring your own adapter
 
 ## Status
 
+- `0.0.21` — fixes: reports work with normal datasets (API assigns `seq`;
+  CLI falls back to list position), file-based workflow stays comparable
+  (quickstart + hints for `--dataset-id`), creation requests are no longer
+  auto-retried on 5xx/transport errors (no duplicate runs/quota), OPERATIONS.md
+  RPO aligned to the shipped daily backup schedule
 - `0.0.20` — CLI gate: `evaldiff run` + `evaldiff diff` with stable exit codes
   (0/1/2), per-case evidence endpoints, JSON/Markdown reports, LocalStorage
   for evidence without S3

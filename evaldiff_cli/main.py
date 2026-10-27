@@ -153,6 +153,23 @@ def _sleep_bounded(seconds: float, deadline: float) -> None:
         time.sleep(wait)
 
 
+# Idempotent methods can be retried safely. POST (dataset / run / signup /
+# diff) may have reached the server before the connection dropped or the
+# 5xx was returned — retrying would create duplicates and reserve quota
+# twice — so those fail with an explicit message instead.
+_IDEMPOTENT_METHODS = {"GET", "HEAD", "DELETE"}
+
+
+def _uncertain_create(cause: ApiError | None) -> typer.Exit:
+    why = f"HTTP {cause.status}" if cause else "transport error (connection dropped)"
+    return _fail(
+        f"the request did not complete ({why}) and creation requests are not "
+        "auto-retried — a retry could create a duplicate dataset/run and consume "
+        "quota again. Check `evaldiff datasets` / `evaldiff runs`; if the "
+        "resource is absent, rerun the same command."
+    )
+
+
 def call(
     gw: Gateway,
     method: str,
@@ -166,12 +183,18 @@ def call(
 ) -> httpx.Response:
     """One logical API call, retried within ``deadline``.
 
-    429 → honor Retry-After (capped by the deadline); 5xx and transport
-    errors → exponential backoff; every other 4xx → terminal (auth,
-    validation, quota-at-enqueue, 409 comparison conflicts...). Never
-    loops past the deadline, never turns an error into success.
+    Retry policy:
+      * 429 → honor Retry-After (capped by the deadline): the server answered,
+        so no side effect happened.
+      * 5xx / transport error on GET/HEAD/DELETE → exponential backoff.
+      * 5xx / transport error on POST → NO retry (see _IDEMPOTENT_METHODS):
+        fail with exit 2 and tell the operator to check before retrying.
+      * every other 4xx → terminal (auth, validation, quota-at-enqueue,
+        409 comparison conflicts...).
+    Never loops past the deadline, never turns an error into success.
     """
     wait = backoff_start
+    idempotent = method.upper() in _IDEMPOTENT_METHODS
     while True:
         if time.monotonic() >= deadline:
             raise DeadlineExceeded(path)
@@ -180,10 +203,14 @@ def call(
         except ApiError as e:
             if e.status == 429:
                 wait = max(wait, min(e.retry_after or wait, backoff_max))
-            elif not (500 <= e.status < 600):
+            elif 500 <= e.status < 600:
+                if not idempotent:
+                    raise _uncertain_create(e)
+            else:
                 raise
         except httpx.TransportError:
-            pass
+            if not idempotent:
+                raise _uncertain_create(None)
         _sleep_bounded(wait, deadline)
         wait = min(wait * 2, backoff_max)
 
@@ -312,7 +339,9 @@ def _build_run_report(gw: Gateway, run_out: dict[str, Any]) -> dict[str, Any]:
     cases = call(
         gw, "GET", f"/v1/runs/{run_out['id']}/cases", deadline=time.monotonic() + CALL_BUDGET
     ).json()
-    by_seq = {c["seq"]: c for c in ds.get("cases", [])}
+    # Position is the fallback join key: real datasets are user JSON without
+    # a seq field; the server assigns seq as the 0-based list position.
+    by_seq = {c.get("seq", i): c for i, c in enumerate(ds.get("cases", []))}
     failed_seqs = [c["seq"] for c in cases if c.get("passed") is not True]
     pass_seqs = [c["seq"] for c in cases if c.get("passed") is True][:REPORT_DETAIL_CASES]
     detail_seqs = (failed_seqs + pass_seqs)[:REPORT_MAX_FETCHES]
@@ -352,7 +381,9 @@ def _build_diff_report(
     gw: Gateway, base_out: dict[str, Any], new_out: dict[str, Any], diff_out: dict[str, Any]
 ) -> dict[str, Any]:
     ds = _fetch_dataset_cases(gw, new_out["dataset_id"])
-    by_seq = {c["seq"]: c for c in ds.get("cases", [])}
+    # Position is the fallback join key: real datasets are user JSON without
+    # a seq field; the server assigns seq as the 0-based list position.
+    by_seq = {c.get("seq", i): c for i, c in enumerate(ds.get("cases", []))}
     reg_seqs = [c["seq"] for c in diff_out.get("regressions", [])]
     other_seqs = [c["seq"] for c in diff_out.get("cases", []) if c["seq"] not in reg_seqs][
         :REPORT_DETAIL_CASES
@@ -644,6 +675,12 @@ def run(
             )
         else:
             raise _fail(f"run {run_id} failed server-side: {out.get('error') or 'unknown error'}")
+        console.print(
+            f"gate the next change against the SAME dataset "
+            f"(`evaldiff run --dataset-id {ds_id} ...`), then "
+            f"`evaldiff diff --base {run_id} --new <new-run>` — runs on "
+            "different datasets cannot be compared"
+        )
         if report:
             try:
                 rep = _build_run_report(gw, out)
@@ -714,7 +751,9 @@ def diff(
         except ApiError as e:
             raise _fail(
                 f"comparison rejected (HTTP {e.status}): {e.detail} — "
-                "runs must be done and use the same dataset"
+                "both runs must be done and use the SAME dataset: rerun the "
+                "new side with `--dataset-id <the dataset id from the first "
+                "run>` (a `--dataset FILE` upload creates a NEW dataset each time)"
             )
         regs = diff_out.get("regressions", [])
         s = diff_out.get("summary") or {}

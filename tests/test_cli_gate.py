@@ -8,6 +8,8 @@ invalid-comparison rejections, report writing, and the exit-code contract.
 
 from __future__ import annotations
 
+import re
+
 import httpx
 import pytest
 from typer.testing import CliRunner
@@ -25,8 +27,11 @@ class MockAPI:
         self.dataset: dict = {
             "name": "ds",
             "cases": [
-                {"seq": 0, "input": "in0", "expected": "exp0", "rubric": None},
-                {"seq": 1, "input": "in1", "expected": "exp1", "rubric": None},
+                # Deliberately NO "seq": real datasets are user JSON and the
+                # API assigns seq as the 0-based position — the CLI must cope
+                # (regression guard for the report join key).
+                {"input": "in0", "expected": "exp0", "rubric": None},
+                {"input": "in1", "expected": "exp1", "rubric": None},
             ],
         }
         self.diff = None
@@ -37,9 +42,22 @@ class MockAPI:
         # (status, body, headers); queue entries are popped one per POST /v1/runs
         self.submit_response = (202, {"id": 41, "status": "queued", "dataset_id": 7}, {})
         self.submit_queue: list[tuple[int, dict, dict]] = []
+        # Fault injection: path -> times to answer 500 before passing through
+        self.fail_once: dict[str, int] = {}
+        # Fault injection: path -> times to raise a transport error
+        self.raise_transport: dict[str, int] = {}
+        # Calls per "METHOD /path" — proves creation requests are not retried
+        self.request_counts: dict[str, int] = {}
 
     def handler(self, request: httpx.Request) -> httpx.Response:
         m, p = request.method, request.url.path
+        self.request_counts[f"{m} {p}"] = self.request_counts.get(f"{m} {p}", 0) + 1
+        if p in self.raise_transport and self.raise_transport[p] > 0:
+            self.raise_transport[p] -= 1
+            raise httpx.ConnectError("connection reset by peer")
+        if p in self.fail_once and self.fail_once[p] > 0:
+            self.fail_once[p] -= 1
+            return httpx.Response(500, json={"detail": "injected 500"})
         if m == "POST" and p == "/v1/auth/signup":
             return httpx.Response(self.signup_status, json=self.signup_body)
         if m == "POST" and p == "/v1/runs":
@@ -299,6 +317,84 @@ def test_run_429_then_ok(mock_api):
         ]
     )
     assert r.exit_code == 0, r.output
+
+
+def test_run_post_5xx_not_retried(mock_api):
+    # 500 on a creation request: the run may already exist server-side —
+    # auto-retry would duplicate the run and reserve quota twice.
+    mock_api.fail_once["/v1/runs"] = 3
+    r = _invoke(
+        [
+            "run",
+            "--key",
+            "k",
+            "--dataset-id",
+            "7",
+            "--endpoint",
+            "http://x/v1",
+            "--model",
+            "m",
+            "--deadline",
+            "5",
+            "--poll",
+            "0.5",
+        ]
+    )
+    assert r.exit_code == 2, r.output
+    flat = re.sub(r"\s+", " ", r.output)  # console wraps + indents long lines
+    assert "not auto-retried" in flat
+    assert mock_api.request_counts.get("POST /v1/runs") == 1
+
+
+def test_run_post_transport_error_not_retried(mock_api):
+    # Connection dropped mid-request: same duplicate-prevention policy.
+    mock_api.raise_transport["/v1/runs"] = 3
+    r = _invoke(
+        [
+            "run",
+            "--key",
+            "k",
+            "--dataset-id",
+            "7",
+            "--endpoint",
+            "http://x/v1",
+            "--model",
+            "m",
+            "--deadline",
+            "5",
+            "--poll",
+            "0.5",
+        ]
+    )
+    assert r.exit_code == 2, r.output
+    flat = re.sub(r"\s+", " ", r.output)  # console wraps + indents long lines
+    assert "transport error" in flat
+    assert mock_api.request_counts.get("POST /v1/runs") == 1
+
+
+def test_poll_get_still_retries_5xx(mock_api):
+    # Idempotent reads keep backoff-retry (unchanged behavior).
+    mock_api.runs[41] = _run_out(41, "done", 2, 2)
+    mock_api.fail_once["/v1/runs/41"] = 2
+    r = _invoke(
+        [
+            "run",
+            "--key",
+            "k",
+            "--dataset-id",
+            "7",
+            "--endpoint",
+            "http://x/v1",
+            "--model",
+            "m",
+            "--deadline",
+            "5",
+            "--poll",
+            "0.5",
+        ]
+    )
+    assert r.exit_code == 0, r.output
+    assert mock_api.request_counts.get("GET /v1/runs/41", 0) >= 3
 
 
 def test_run_requires_dataset_or_id(mock_api):

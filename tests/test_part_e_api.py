@@ -40,6 +40,9 @@ def test_dataset_cases_endpoint(client) -> None:
     assert body["case_count"] == 2
     assert body["cases"][0]["input"] == "in0"
     assert body["cases"][0]["rubric"] == ["mentions 30-day"]
+    # seq = 0-based dataset position — the join key the CLI report builders
+    # rely on (user case JSON carries no seq of its own).
+    assert [c["seq"] for c in body["cases"]] == [0, 1]
     # account-scoped: other account gets 404 (no existence leakage)
     assert (
         client.get(

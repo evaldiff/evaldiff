@@ -365,6 +365,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 raise HTTPException(502, f"dataset content unavailable: {exc}")
         if cases is None:
             raise HTTPException(500, "dataset has no readable cases")
+        # seq = 0-based position in the dataset list — the same index the
+        # runner assigns RunCase rows (`for seq, c in enumerate(cases)`).
+        # Dataset cases are user JSON and carry no seq of their own; the
+        # CLI joins dataset cases ↔ run cases on this key in reports.
+        cases = [{**c, "seq": i} for i, c in enumerate(cases)]
         return {"id": ds.id, "name": ds.name, "case_count": len(cases), "cases": cases}
 
     @app.post("/v1/runs", response_model=RunOut, status_code=status.HTTP_202_ACCEPTED)
