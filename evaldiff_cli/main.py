@@ -652,7 +652,8 @@ def run(
                     console.print(f"wrote {p}")
             except ApiError as e:
                 console.print(f"[yellow]warning: report incomplete ({_auth_err(e)})[/yellow]")
-            except (OSError, json.JSONDecodeError) as e:
+            except (OSError, json.JSONDecodeError, KeyError, TypeError) as e:
+                # incl. KeyError: server predates the evidence endpoints
                 console.print(f"[yellow]warning: could not write report ({e})[/yellow]")
         raise typer.Exit(EXIT_PASS if outcome == "pass" else EXIT_GATE_FAIL)
     except ApiError as e:
@@ -752,7 +753,8 @@ def diff(
                 console.print(
                     f"[yellow]warning: report incomplete (HTTP {e.status}: {e.detail})[/yellow]"
                 )
-            except (OSError, json.JSONDecodeError) as e:
+            except (OSError, json.JSONDecodeError, KeyError, TypeError) as e:
+                # incl. KeyError: server predates the evidence endpoints
                 console.print(f"[yellow]warning: could not write report ({e})[/yellow]")
     finally:
         gw.close()
