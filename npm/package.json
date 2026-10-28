@@ -1,14 +1,12 @@
 {
   "name": "@evaldiff/evaldiff",
-  "version": "0.0.23",
+  "version": "0.0.24",
   "description": "CI for LLM prompts: datasets, eval runs, and regression diffs as a pass/fail gate. CLI placeholder + future GitHub Action.",
-  "main": "index.js",
   "bin": {
     "evaldiff": "bin/evaldiff.js"
   },
   "files": [
-    "bin",
-    "index.js"
+    "bin"
   ],
   "scripts": {
     "test": "node test.js"
